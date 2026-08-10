@@ -1,0 +1,13 @@
+{
+  "name": "fbpages-cloud-personal",
+  "version": "1.0.0",
+  "description": "Personal, account-free, cloud-hosted Facebook Business Page scraper. Page URLs in, public contact info scraped, results straight into a Google Sheet.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "scrape": "node scraper.js"
+  },
+  "dependencies": {
+    "playwright": "^1.48.0"
+  }
+}
