@@ -70,21 +70,23 @@ async function loginToFacebook(browser) {
   try {
     await page.goto('https://www.facebook.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
     await dismissOverlaysIfPresent(page);
-    await sleep(1500);
+    await sleep(2000);
 
     console.log('  Filling credentials...');
-    await page.fill('#email', FACEBOOK_EMAIL);
-    await sleep(400);
-    await page.fill('#pass', FACEBOOK_PASSWORD);
-    await sleep(400);
-    await page.click('[name="login"]');
+    // Wait for the email field to be present before filling
+    await page.waitForSelector('input[name="email"]', { timeout: 15000 });
+    await page.fill('input[name="email"]', FACEBOOK_EMAIL);
+    await sleep(500);
+    await page.fill('input[type="password"]', FACEBOOK_PASSWORD);
+    await sleep(500);
+    await page.click('button[name="login"]');
 
     await page.waitForTimeout(6000);
     const url = page.url();
     console.log('  Post-login URL: ' + url);
 
     if (url.includes('checkpoint') || url.includes('two_step_verification')) {
-      console.log('  WARNING: Facebook checkpoint detected — 2FA or unusual login. Scraping may still be blocked.');
+      console.log('  WARNING: Facebook checkpoint detected — 2FA or unusual login.');
     } else if (url.includes('login')) {
       console.log('  WARNING: Still on login page — credentials may be wrong or blocked.');
     } else {
@@ -115,7 +117,6 @@ async function scrapePage(browser, rawUrl, fbCookies = []) {
     locale: 'en-US'
   });
 
-  // Inject Facebook session cookies so we appear logged in
   if (fbCookies.length > 0) {
     await context.addCookies(fbCookies);
   }
@@ -128,10 +129,9 @@ async function scrapePage(browser, rawUrl, fbCookies = []) {
     await dismissOverlaysIfPresent(page);
     await sleep(randomDelay([2500, 4500]));
 
-    // Detect redirect to meta.com (not logged in / blocked)
     const currentUrl = page.url();
     if (currentUrl.includes('meta.com') || currentUrl.includes('login')) {
-      console.log('  Redirected to: ' + currentUrl + ' — skipping this page.');
+      console.log('  Redirected to: ' + currentUrl + ' — skipping.');
       await context.close();
       return lead;
     }
@@ -175,7 +175,6 @@ async function scrapePage(browser, rawUrl, fbCookies = []) {
       } catch (_) {}
     }
 
-    // Log all extracted values
     console.log(`  Name:    ${lead.name    || '—'}`);
     console.log(`  Phone:   ${lead.phone   || '—'}`);
     console.log(`  Email:   ${lead.email   || '—'}`);
