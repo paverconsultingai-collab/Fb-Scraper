@@ -156,15 +156,32 @@ async function scrapePage(browser, rawUrl) {
     return lead;
 }
 
-async function main() {
-    const rawUrls = process.env.PAGE_URLS || '';
-    const pageUrls = rawUrls
-        .split(/\r?\n|\|/)
-        .map(u => u.trim())
-        .filter(Boolean);
+async function fetchPageUrlsFromSheet(sheetUrl) {
+    let csvUrl = sheetUrl;
+    if (sheetUrl.includes('/pubhtml')) {
+        csvUrl = sheetUrl.replace('/pubhtml', '/pub');
+        if (!csvUrl.includes('output=csv')) csvUrl += '&output=csv';
+    } else if (sheetUrl.includes('/edit')) {
+        csvUrl = sheetUrl.replace(/\/edit.*$/, '/export?format=csv');
+    } else if (!sheetUrl.includes('output=csv') && !sheetUrl.includes('format=csv')) {
+        csvUrl = sheetUrl + (sheetUrl.includes('?') ? '&' : '?') + 'output=csv';
+    }
+    console.log('Fetching Facebook URLs from sheet...');
+    const response = await fetch(csvUrl);
+    if (!response.ok) throw new Error('Sheet fetch failed: ' + response.status);
+    const csvText = await response.text();
+    const rows = csvText.split('\n').map(r => r.split(','));
+    const urls = rows.slice(1)
+        .map(r => (r[0] || '').trim().replace(/^"|"$/g, ''))
+        .filter(u => u && u.startsWith('http'));
+    console.log('Found ' + urls.length + ' Facebook URLs in sheet.');
+    return urls;
+}
 
-    if (!pageUrls.length) {
-        console.error('No Page URLs provided. Set the PAGE_URLS environment variable (one per line, or "|"-separated).');
+async function main() {
+    const SHEET_READ_URL = process.env.SHEET_READ_URL;
+    if (!SHEET_READ_URL) {
+        console.error('SHEET_READ_URL environment variable is not set.');
         process.exit(1);
     }
     if (!SHEET_WEBHOOK_URL) {
@@ -172,7 +189,14 @@ async function main() {
         process.exit(1);
     }
 
-    console.log(`Running ${pageUrls.length} page(s)...`);
+    const pageUrls = await fetchPageUrlsFromSheet(SHEET_READ_URL);
+
+    if (!pageUrls.length) {
+        console.log('No Facebook URLs found in sheet. Exiting.');
+        process.exit(0);
+    }
+
+    console.log('Running ' + pageUrls.length + ' page(s)...');
     await ensureHeaderRow();
 
     const browser = await chromium.launch({ headless: true });
@@ -182,10 +206,9 @@ async function main() {
         for (let i = 0; i < pageUrls.length; i++) {
             const lead = await scrapePage(browser, pageUrls[i]);
             leads.push(lead);
-
             if (i < pageUrls.length - 1) {
                 const delay = randomDelay(BETWEEN_PAGE_DELAY_MS);
-                console.log(`  Waiting ${Math.round(delay / 1000)}s before next page...`);
+                console.log('  Waiting ' + Math.round(delay / 1000) + 's before next page...');
                 await sleep(delay);
             }
         }
@@ -194,7 +217,7 @@ async function main() {
     }
 
     await appendLeads(SHEET_WEBHOOK_URL, SHEET_TAB, leads);
-    console.log(`\nDone. ${leads.length} page(s) processed and written to the sheet.`);
+    console.log('\nDone. ' + leads.length + ' page(s) processed and written to the sheet.');
 }
 
 main().catch(error => {
