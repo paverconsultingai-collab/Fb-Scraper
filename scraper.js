@@ -1,38 +1,29 @@
 // scraper.js
-// Personal, account-free, cloud-hosted Facebook Business Page scraper.
-//
-// Deliberately logged-out — no cookies, no session, no account risk.
-// Business Pages generally expose contact info (phone/email/website/address)
-// publicly since that's the point of having a Page, unlike personal profiles.
-//
-// This is a text/regex-based extraction (same technique your original
-// extension's pageScraper() used) rather than structured DOM parsing,
-// since Facebook's class names are obfuscated and change often — reading
-// the rendered page text is more resilient to that churn.
+// Personal, cloud-hosted Facebook Business Page scraper.
+// Logs into Facebook before scraping to avoid meta.com redirects.
 
 import { chromium } from 'playwright';
 import { ensureHeaderRow, appendLeads } from './sheets.js';
 
-const SHEET_WEBHOOK_URL = process.env.SHEET_WEBHOOK_URL;
-const SHEET_TAB = process.env.SHEET_TAB || 'FB Leads';
-const BETWEEN_PAGE_DELAY_MS = [4000, 9000]; // randomized, mimics human pacing
+const SHEET_WEBHOOK_URL  = process.env.SHEET_WEBHOOK_URL;
+const SHEET_TAB          = process.env.SHEET_TAB || 'FB Leads';
+const FACEBOOK_EMAIL     = process.env.FACEBOOK_EMAIL;
+const FACEBOOK_PASSWORD  = process.env.FACEBOOK_PASSWORD;
+const BETWEEN_PAGE_DELAY_MS = [4000, 9000];
 const DEBUG = (process.env.DEBUG || '').toLowerCase() === 'true';
 
 function randomDelay([min, max]) {
   return min + Math.floor(Math.random() * (max - min));
 }
-
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
-
 function normalizePageUrl(rawUrl) {
   let url = rawUrl.trim();
   if (!url.startsWith('http')) url = `https://${url}`;
   url = url.split('?')[0].replace(/\/+$/, '');
   return url;
 }
-
 function decodeFacebookRedirect(href) {
   try {
     const parsed = new URL(href);
@@ -40,9 +31,7 @@ function decodeFacebookRedirect(href) {
       return decodeURIComponent(parsed.searchParams.get('u'));
     }
     return href;
-  } catch (_) {
-    return href;
-  }
+  } catch (_) { return href; }
 }
 
 async function dismissOverlaysIfPresent(page) {
@@ -59,11 +48,64 @@ async function dismissOverlaysIfPresent(page) {
         await btn.click();
         await page.waitForTimeout(800);
       }
-    } catch (_) { /* not present */ }
+    } catch (_) {}
   }
 }
 
-async function scrapePage(browser, rawUrl) {
+// =============================================
+// FACEBOOK LOGIN — runs once, returns cookies
+// =============================================
+async function loginToFacebook(browser) {
+  if (!FACEBOOK_EMAIL || !FACEBOOK_PASSWORD) {
+    console.log('No Facebook credentials set — skipping login.');
+    return [];
+  }
+  console.log('\n=== Logging in to Facebook ===');
+  const context = await browser.newContext({
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    viewport: { width: 1366, height: 900 },
+    locale: 'en-US'
+  });
+  const page = await context.newPage();
+  try {
+    await page.goto('https://www.facebook.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await dismissOverlaysIfPresent(page);
+    await sleep(1500);
+
+    console.log('  Filling credentials...');
+    await page.fill('#email', FACEBOOK_EMAIL);
+    await sleep(400);
+    await page.fill('#pass', FACEBOOK_PASSWORD);
+    await sleep(400);
+    await page.click('[name="login"]');
+
+    await page.waitForTimeout(6000);
+    const url = page.url();
+    console.log('  Post-login URL: ' + url);
+
+    if (url.includes('checkpoint') || url.includes('two_step_verification')) {
+      console.log('  WARNING: Facebook checkpoint detected — 2FA or unusual login. Scraping may still be blocked.');
+    } else if (url.includes('login')) {
+      console.log('  WARNING: Still on login page — credentials may be wrong or blocked.');
+    } else {
+      console.log('  Login successful!');
+    }
+
+    const cookies = await context.cookies(['https://www.facebook.com']);
+    console.log('  Saved ' + cookies.length + ' session cookies.');
+    await context.close();
+    return cookies;
+  } catch (err) {
+    console.log('  Login error: ' + err.message);
+    await context.close();
+    return [];
+  }
+}
+
+// =============================================
+// SCRAPE ONE PAGE
+// =============================================
+async function scrapePage(browser, rawUrl, fbCookies = []) {
   const pageUrl = normalizePageUrl(rawUrl);
   console.log(`\n--- Scraping: ${pageUrl} ---`);
 
@@ -72,14 +114,27 @@ async function scrapePage(browser, rawUrl) {
     viewport: { width: 1366, height: 900 },
     locale: 'en-US'
   });
-  const page = await context.newPage();
 
+  // Inject Facebook session cookies so we appear logged in
+  if (fbCookies.length > 0) {
+    await context.addCookies(fbCookies);
+  }
+
+  const page = await context.newPage();
   const lead = { pageUrl, name: '', category: '', phone: '', email: '', website: '', address: '', about: '' };
 
   try {
     await page.goto(`${pageUrl}/about`, { waitUntil: 'domcontentloaded', timeout: 45000 });
     await dismissOverlaysIfPresent(page);
     await sleep(randomDelay([2500, 4500]));
+
+    // Detect redirect to meta.com (not logged in / blocked)
+    const currentUrl = page.url();
+    if (currentUrl.includes('meta.com') || currentUrl.includes('login')) {
+      console.log('  Redirected to: ' + currentUrl + ' — skipping this page.');
+      await context.close();
+      return lead;
+    }
 
     const data = await page.evaluate(() => {
       const title = document.title.replace(/\s*\|\s*Facebook\s*$/i, '').trim();
@@ -102,8 +157,7 @@ async function scrapePage(browser, rawUrl) {
       lead.phone = phoneSectionMatch[1].trim();
     } else {
       const phoneRegex = /(\+?\d[\d ()\-.\u00A0]{7,}\d)/g;
-      const phones = data.bodyText.match(phoneRegex) || [];
-      lead.phone = phones[0] || '';
+      lead.phone = (data.bodyText.match(phoneRegex) || [])[0] || '';
     }
 
     const addressMatch = data.bodyText.match(/Address\s*\n?\s*([^\n]{5,120})/i);
@@ -118,10 +172,10 @@ async function scrapePage(browser, rawUrl) {
       try {
         const host = new URL(resolved).hostname.replace('www.', '');
         if (!excludedHosts.some(h => host.includes(h))) { lead.website = resolved; break; }
-      } catch (_) { /* skip malformed href */ }
+      } catch (_) {}
     }
 
-    // --- Log all extracted values ---
+    // Log all extracted values
     console.log(`  Name:    ${lead.name    || '—'}`);
     console.log(`  Phone:   ${lead.phone   || '—'}`);
     console.log(`  Email:   ${lead.email   || '—'}`);
@@ -130,12 +184,12 @@ async function scrapePage(browser, rawUrl) {
 
     const gotAnything = lead.email || lead.phone || lead.website || lead.address;
     if (!gotAnything) {
-      console.log('  No contact fields found — Page may require login or structure changed.');
-      if (DEBUG) console.log(`  (debug) title="${lead.name}" bodyText length=${data.bodyText.length}`);
+      console.log('  No contact fields found.');
+      if (DEBUG) console.log(`  (debug) bodyText length=${data.bodyText.length}`);
     }
 
   } catch (error) {
-    console.log(`  Error scraping this page: ${error.message}`);
+    console.log(`  Error: ${error.message}`);
   }
 
   await context.close();
@@ -170,29 +224,26 @@ async function main() {
   if (!SHEET_WEBHOOK_URL) { console.error('SHEET_WEBHOOK_URL not set.'); process.exit(1); }
 
   const pageUrls = await fetchPageUrlsFromSheet(SHEET_READ_URL);
-  if (!pageUrls.length) {
-    console.log('No Facebook URLs found in sheet. Exiting.');
-    process.exit(0);
-  }
+  if (!pageUrls.length) { console.log('No URLs found. Exiting.'); process.exit(0); }
 
   console.log('Running ' + pageUrls.length + ' page(s)...\n');
   await ensureHeaderRow();
 
   const browser = await chromium.launch({ headless: true });
-  let sent = 0;
 
+  // Log in once — cookies shared across all page scrapes
+  const fbCookies = await loginToFacebook(browser);
+
+  let sent = 0;
   try {
     for (let i = 0; i < pageUrls.length; i++) {
-      // 1. Scrape the page
-      const lead = await scrapePage(browser, pageUrls[i]);
+      const lead = await scrapePage(browser, pageUrls[i], fbCookies);
 
-      // 2. Send immediately — don't wait for all pages
       console.log('  Sending to sheet...');
       await appendLeads(SHEET_WEBHOOK_URL, SHEET_TAB, [lead]);
       sent++;
       console.log(`  Sent to sheet OK (${sent}/${pageUrls.length})`);
 
-      // 3. Next URL
       if (i < pageUrls.length - 1) {
         const delay = randomDelay(BETWEEN_PAGE_DELAY_MS);
         console.log(' Waiting ' + Math.round(delay / 1000) + 's before next page...');
@@ -206,7 +257,4 @@ async function main() {
   console.log('\nDone. ' + sent + '/' + pageUrls.length + ' page(s) sent to the sheet.');
 }
 
-main().catch(error => {
-  console.error('Fatal error:', error);
-  process.exit(1);
-});
+main().catch(err => { console.error('Fatal error:', err); process.exit(1); });
