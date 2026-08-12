@@ -236,11 +236,16 @@ async function main() {
   if (!SHEET_READ_URL)    { console.error('SHEET_READ_URL not set.');    process.exit(1); }
   if (!SHEET_WEBHOOK_URL) { console.error('SHEET_WEBHOOK_URL not set.'); process.exit(1); }
 
-  const pageUrls = await fetchPageUrlsFromSheet(SHEET_READ_URL);
-  if (!pageUrls.length) { console.log('No URLs found. Exiting.'); process.exit(0); }
+  const allPageUrls = await fetchPageUrlsFromSheet(SHEET_READ_URL);
+  if (!allPageUrls.length) { console.log('No URLs found. Exiting.'); process.exit(0); }
+    const BATCH_SIZE = 10;
+    const startIndex = parseInt(process.env.START_INDEX || '0', 10);
+    const batchUrls = allPageUrls.slice(startIndex, startIndex + BATCH_SIZE);
+    const nextIndex = startIndex + BATCH_SIZE;
+    const hasMore = nextIndex < allPageUrls.length;
 
   const hasCookies = FB_COOKIES.length > 0;
-  console.log(`Running ${pageUrls.length} page(s). Strategy: anon-first${ hasCookies ? ', cookie fallback for blocked' : ' (no cookie fallback)' }...\n`);
+  console.log(`Running ${batchUrls.length} page(s). Strategy: anon-first${ hasCookies ? ', cookie fallback for blocked' : ' (no cookie fallback)' }...\n`);
   await ensureHeaderRow();
 
   const browser = await chromium.launch({
@@ -250,17 +255,17 @@ async function main() {
   let sent = 0;
 
   try {
-    for (let i = 0; i < pageUrls.length; i++) {
-      const lead = await scrapePage(browser, pageUrls[i]);
+    for (let i = 0; i < batchUrls.length; i++) {
+      const lead = await scrapePage(browser, batchUrls[i]);
       try {
         console.log('  Sending to sheet...');
         await appendLeads(SHEET_WEBHOOK_URL, SHEET_TAB, [lead]);
         sent++;
-        console.log(`  Sent to sheet OK (${sent}/${pageUrls.length})`);
+        console.log(`  Sent to sheet OK (${sent}/${batchUrls.length})`);
       } catch (webhookErr) {
         console.warn(`  Webhook error (continuing): ${webhookErr.message.slice(0, 120)}`);
       }
-      if (i < pageUrls.length - 1) {
+      if (i < batchUrls.length - 1) {
         const delay = randomDelay(BETWEEN_PAGE_DELAY_MS);
         console.log(' Waiting ' + Math.round(delay / 1000) + 's before next page...');
         await sleep(delay);
@@ -270,7 +275,25 @@ async function main() {
     await browser.close();
   }
 
-  console.log('\nDone. ' + sent + '/' + pageUrls.length + ' page(s) sent.');
+  console.log('\nDone. ' + sent + '/' + batchUrls.length + ' page(s) sent.');
+    // Auto-trigger next batch if more pages remain
+    if (hasMore) {
+          const ghToken = process.env.GITHUB_TOKEN;
+          const ghRepo  = process.env.GITHUB_REPOSITORY;
+          if (ghToken && ghRepo) {
+                  console.log(`Triggering next batch (start_index=${nextIndex})...`);
+                  const res = await fetch(
+                            `https://api.github.com/repos/${ghRepo}/actions/workflows/scrape.yml/dispatches`,
+                            { method: 'POST',
+                                       headers: { 'Authorization': `Bearer ${ghToken}`, 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json' },
+                                       body: JSON.stringify({ ref: 'main', inputs: { start_index: String(nextIndex), debug: process.env.DEBUG || 'false' } })
+                            }
+                          );
+                  if (res.ok || res.status === 204) {
+                            console.log(`Next batch triggered. Status: ${res.status}`);
+                          } else { const body = await res.text(); console.warn(`Trigger failed: ${res.status}`); }
+                } else { console.warn('GITHUB_TOKEN or GITHUB_REPOSITORY not set.'); }
+        } else { console.log('All pages processed — no more batches.'); }
 }
 
 main().catch(err => { console.error('Fatal error:', err); process.exit(1); });
