@@ -17,6 +17,8 @@ on:
 jobs:
   scrape:
     runs-on: ubuntu-latest
+        permissions:
+              actions: write
     timeout-minutes: 60
     steps:
       - name: Check out repo
