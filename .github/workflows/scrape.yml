@@ -30,10 +30,9 @@ jobs:
 
       - name: Run scraper
         env:
-          SHEET_READ_URL:    ${{ secrets.SHEET_READ_URL }}
-          SHEET_WEBHOOK_URL: ${{ secrets.SHEET_WEBHOOK_URL }}
-          SHEET_TAB:         ${{ vars.FB_SHEET_TAB }}
-          FACEBOOK_EMAIL:    ${{ secrets.FACEBOOK_EMAIL }}
-          FACEBOOK_PASSWORD: ${{ secrets.FACEBOOK_PASSWORD }}
-          DEBUG:             ${{ github.event.inputs.debug }}
+          SHEET_READ_URL:     ${{ secrets.SHEET_READ_URL }}
+          SHEET_WEBHOOK_URL:  ${{ secrets.SHEET_WEBHOOK_URL }}
+          SHEET_TAB:          ${{ vars.FB_SHEET_TAB }}
+          FACEBOOK_COOKIES:   ${{ secrets.FACEBOOK_COOKIES }}
+          DEBUG:              ${{ github.event.inputs.debug }}
         run: npm run scrape
