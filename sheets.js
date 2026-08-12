@@ -26,7 +26,8 @@ export async function appendLeads(webhookUrl, tabName, leads) {
     });
 
     const rawText = await response.text();
-    console.log(`Webhook [${lead.pageUrl}]: ${rawText}`);
+    // Truncate log to prevent GitHub Actions log overflow
+    console.log(`Webhook [${lead.pageUrl}]: ${rawText.slice(0, 200)}`);
 
     if (!response.ok) {
       throw new Error(
