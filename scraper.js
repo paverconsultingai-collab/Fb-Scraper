@@ -1,26 +1,24 @@
-// scraper.js
-// Cloud-hosted Facebook Business Page scraper.
-// Uses session cookies injected via FACEBOOK_COOKIES secret for authenticated access.
-// Accepts TWO formats:
-//   1. JSON array  (Cookie-Editor export)
-//   2. Raw string  (paste the Cookie header value from Chrome DevTools Network tab)
-// Falls back to anonymous scraping if no cookies provided.
+// scraper.js  v3 — Hybrid: anonymous-first, cookie fallback for blocked pages
+// Why: anonymous mode gets Facebook's static preview (has contact info).
+// Authenticated mode triggers the React SPA (dynamic, harder to extract).
+// Strategy: scrape anonymously first. If redirected to login, retry with cookies.
 
 import { chromium } from 'playwright';
 import { ensureHeaderRow, appendLeads } from './sheets.js';
 
 const SHEET_WEBHOOK_URL     = process.env.SHEET_WEBHOOK_URL;
 const SHEET_TAB             = process.env.SHEET_TAB || 'FB Leads';
-const BETWEEN_PAGE_DELAY_MS = [5000, 10000];
-const PAGE_LOAD_WAIT_MS     = [6000, 10000];  // wait after 'load' for React to render
+const BETWEEN_PAGE_DELAY_MS = [4000, 9000];
+const ANON_WAIT_MS          = [2500, 4500];   // anon: static HTML, renders fast
+const AUTH_WAIT_MS          = [7000, 11000];  // auth: React SPA, needs longer
 const DEBUG = (process.env.DEBUG || '').toLowerCase() === 'true';
 
-// Load Facebook session cookies from secret
+// Load Facebook session cookies (used as fallback for blocked pages only)
 let FB_COOKIES = [];
 try {
   const raw = (process.env.FACEBOOK_COOKIES || '').trim();
   if (!raw || raw === '[]') {
-    console.log('[auth] No FACEBOOK_COOKIES set — running anonymous.');
+    console.log('[auth] No FACEBOOK_COOKIES — blocked pages will be skipped.');
   } else if (raw.startsWith('[')) {
     const parsed = JSON.parse(raw);
     FB_COOKIES = parsed.map(c => ({
@@ -33,7 +31,7 @@ try {
       sameSite: c.sameSite || 'None',
       expires:  c.expires ?? c.expirationDate ?? -1
     }));
-    console.log(`[auth] Loaded ${FB_COOKIES.length} cookies (JSON) — authenticated mode.`);
+    console.log(`[auth] Loaded ${FB_COOKIES.length} cookies (JSON) — cookie fallback ready.`);
   } else {
     FB_COOKIES = raw.split(';').map(pair => {
       const eqIdx = pair.indexOf('=');
@@ -43,18 +41,14 @@ try {
       if (!name) return null;
       return { name, value, domain: '.facebook.com', path: '/', secure: true, sameSite: 'None' };
     }).filter(Boolean);
-    console.log(`[auth] Loaded ${FB_COOKIES.length} cookies (raw string) — authenticated mode.`);
+    console.log(`[auth] Loaded ${FB_COOKIES.length} cookies (raw) — cookie fallback ready.`);
   }
 } catch (e) {
-  console.warn('[auth] Could not parse FACEBOOK_COOKIES — running anonymous. Error:', e.message);
+  console.warn('[auth] Could not parse FACEBOOK_COOKIES:', e.message);
 }
 
-function randomDelay([min, max]) {
-  return min + Math.floor(Math.random() * (max - min));
-}
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
+function randomDelay([min, max]) { return min + Math.floor(Math.random() * (max - min)); }
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 function normalizePageUrl(rawUrl) {
   let url = rawUrl.trim();
   if (!url.startsWith('http')) url = `https://${url}`;
@@ -64,43 +58,32 @@ function normalizePageUrl(rawUrl) {
 function decodeFacebookRedirect(href) {
   try {
     const parsed = new URL(href);
-    if (parsed.hostname.includes('l.facebook.com') && parsed.searchParams.has('u')) {
+    if (parsed.hostname.includes('l.facebook.com') && parsed.searchParams.has('u'))
       return decodeURIComponent(parsed.searchParams.get('u'));
-    }
     return href;
   } catch (_) { return href; }
 }
 function isBlocked(url) {
-  return (
-    url.includes('meta.com') ||
-    url.includes('/login') ||
-    url.includes('checkpoint') ||
-    url.includes('two_step_verification')
-  );
+  return url.includes('meta.com') || url.includes('/login') ||
+         url.includes('checkpoint') || url.includes('two_step_verification');
 }
 
-async function dismissOverlaysIfPresent(page) {
-  const selectors = [
+async function dismissOverlays(page) {
+  for (const sel of [
     'button:has-text("Decline optional cookies")',
     'button:has-text("Allow all cookies")',
     '[aria-label="Close"]',
     'button:has-text("Not Now")'
-  ];
-  for (const selector of selectors) {
+  ]) {
     try {
-      const btn = page.locator(selector).first();
-      if (await btn.isVisible({ timeout: 2000 })) {
-        await btn.click();
-        await page.waitForTimeout(800);
-      }
+      const btn = page.locator(sel).first();
+      if (await btn.isVisible({ timeout: 1500 })) { await btn.click(); await sleep(600); }
     } catch (_) {}
   }
 }
 
-async function scrapePage(browser, rawUrl) {
-  const pageUrl = normalizePageUrl(rawUrl);
-  console.log(`\n--- Scraping: ${pageUrl} ---`);
-
+// Core scrape: one attempt with a given context (anon or authenticated)
+async function scrapeWithContext(browser, pageUrl, useCookies) {
   const context = await browser.newContext({
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
     viewport:  { width: 1440, height: 900 },
@@ -108,100 +91,121 @@ async function scrapePage(browser, rawUrl) {
     extraHTTPHeaders: { 'Accept-Language': 'en-US,en;q=0.9' }
   });
 
-  // Hide automation fingerprint so Facebook serves full content
   await context.addInitScript(() => {
-    Object.defineProperty(navigator, 'webdriver',  { get: () => false });
-    Object.defineProperty(navigator, 'languages',  { get: () => ['en-US', 'en'] });
-    Object.defineProperty(navigator, 'plugins',    { get: () => [1, 2, 3, 4, 5] });
+    Object.defineProperty(navigator, 'webdriver', { get: () => false });
+    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+    Object.defineProperty(navigator, 'plugins',   { get: () => [1, 2, 3, 4, 5] });
     window.chrome = { runtime: {} };
   });
 
-  // Inject session cookies so requests appear authenticated
-  if (FB_COOKIES.length > 0) {
+  if (useCookies && FB_COOKIES.length > 0) {
     await context.addCookies(FB_COOKIES);
   }
 
   const page = await context.newPage();
-  const lead = { pageUrl, name: '', category: '', phone: '', email: '', website: '', address: '', about: '' };
+  const result = { blocked: false, name: '', phone: '', email: '', website: '', address: '', about: '', category: '' };
 
   try {
     const aboutUrl = pageUrl.includes('profile.php') ? pageUrl : `${pageUrl}/about`;
+    await page.goto(aboutUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await dismissOverlays(page);
 
-    // 'load' = page + scripts fully loaded; Facebook never reaches networkidle
-    // (it constantly makes background requests for ads/analytics)
-    await page.goto(aboutUrl, { waitUntil: 'load', timeout: 45000 });
-    await dismissOverlaysIfPresent(page);
-
-    // Wait for React to finish rendering the contact section
-    await sleep(randomDelay(PAGE_LOAD_WAIT_MS));
+    // Anon: static HTML ready fast. Auth: React SPA needs more time.
+    await sleep(randomDelay(useCookies ? AUTH_WAIT_MS : ANON_WAIT_MS));
 
     const currentUrl = page.url();
     if (isBlocked(currentUrl)) {
-      console.log('  Blocked (' + currentUrl.split('/')[2] + ') — skipping.');
+      result.blocked = true;
       await context.close();
-      return lead;
+      return result;
     }
 
-    const data = await page.evaluate(() => {
-      const title   = document.title.replace(/\s*\|\s*Facebook\s*$/i, '').trim();
-      const ogDesc  = document.querySelector('meta[property="og:description"]')?.content || '';
-      const bodyText = document.body ? document.body.innerText || '' : '';
-      const links   = [...document.querySelectorAll('a[href]')].map(a => ({
-        href: a.href,
-        text: (a.innerText || '').trim()
-      }));
-      return { title, ogDesc, bodyText, bodyLen: bodyText.length, links };
-    });
+    const data = await page.evaluate(() => ({
+      title:    document.title.replace(/\s*\|\s*Facebook\s*$/i, '').trim(),
+      ogDesc:   document.querySelector('meta[property="og:description"]')?.content || '',
+      bodyText: document.body?.innerText || '',
+      bodyLen:  (document.body?.innerText || '').length,
+      links:    [...document.querySelectorAll('a[href]')].map(a => ({ href: a.href, text: (a.innerText||'').trim() }))
+    }));
 
-    // Log body length — helps diagnose stripped/empty pages
-    console.log(`  [page] body: ${data.bodyLen} chars`);
+    console.log(`  [body] ${data.bodyLen} chars` + (useCookies ? ' (auth)' : ' (anon)'));
 
-    lead.name  = data.title || '';
-    lead.about = data.ogDesc || '';
+    result.name  = data.title  || '';
+    result.about = data.ogDesc || '';
 
     const emailRegex = /([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})/g;
-    lead.email = (data.bodyText.match(emailRegex) || [])
+    result.email = (data.bodyText.match(emailRegex) || [])
       .find(e => !e.toLowerCase().endsWith('.png') && !e.includes('sentry') && !e.includes('facebook')) || '';
 
     const phoneSectionMatch = data.bodyText.match(/Phone number\s*\n?\s*([+()\d][\d\s().-]{6,}\d)/i);
     if (phoneSectionMatch) {
-      lead.phone = phoneSectionMatch[1].trim();
+      result.phone = phoneSectionMatch[1].trim();
     } else {
-      const phoneRegex = /(\+?\d[\d ()\-.\u00A0]{7,}\d)/g;
-      lead.phone = (data.bodyText.match(phoneRegex) || [])[0] || '';
+      result.phone = (data.bodyText.match(/(\+?\d[\d ()\-.\u00A0]{7,}\d)/g) || [])[0] || '';
     }
 
-    const addressMatch = data.bodyText.match(/Address\s*\n?\s*([^\n]{5,120})/i);
-    if (addressMatch) lead.address = addressMatch[1].trim();
+    const addrMatch = data.bodyText.match(/Address\s*\n?\s*([^\n]{5,120})/i);
+    if (addrMatch) result.address = addrMatch[1].trim();
 
-    const categoryMatch = data.bodyText.match(/\n(Restaurant|Local Business|Shopping & Retail|Product\/Service|Professional Service|Health\/Beauty|Home Improvement|Real Estate|Automotive|Medical & Health|Education|Contractor|Plumbing Service|Roofing Contractor)\n/i);
-    if (categoryMatch) lead.category = categoryMatch[1];
+    const catMatch = data.bodyText.match(/\n(Restaurant|Local Business|Shopping & Retail|Product\/Service|Professional Service|Health\/Beauty|Home Improvement|Real Estate|Automotive|Medical & Health|Education|Contractor|Plumbing Service|Roofing Contractor)\n/i);
+    if (catMatch) result.category = catMatch[1];
 
-    const excludedHosts = ['facebook.com', 'fb.com', 'fb.me', 'instagram.com', 'messenger.com'];
+    const excluded = ['facebook.com','fb.com','fb.me','instagram.com','messenger.com'];
     for (const link of data.links) {
       const resolved = decodeFacebookRedirect(link.href);
       try {
-        const host = new URL(resolved).hostname.replace('www.', '');
-        if (!excludedHosts.some(h => host.includes(h))) { lead.website = resolved; break; }
+        const host = new URL(resolved).hostname.replace('www.','');
+        if (!excluded.some(h => host.includes(h))) { result.website = resolved; break; }
       } catch (_) {}
     }
 
-    console.log(`  Name:    ${lead.name    || '—'}`);
-    console.log(`  Phone:   ${lead.phone   || '—'}`);
-    console.log(`  Email:   ${lead.email   || '—'}`);
-    console.log(`  Website: ${lead.website || '—'}`);
-    console.log(`  Address: ${lead.address || '—'}`);
-
-    const gotAnything = lead.email || lead.phone || lead.website || lead.address;
-    if (!gotAnything) {
-      console.log('  No contact fields found.');
-    }
-
   } catch (err) {
-    console.log(`  Error: ${err.message}`);
+    console.log(`  Error: ${err.message.slice(0,120)}`);
   }
 
   await context.close();
+  return result;
+}
+
+async function scrapePage(browser, rawUrl) {
+  const pageUrl = normalizePageUrl(rawUrl);
+  console.log(`\n--- Scraping: ${pageUrl} ---`);
+
+  // Pass 1: anonymous — gets static HTML with contact info
+  let result = await scrapeWithContext(browser, pageUrl, false);
+
+  // Pass 2: if blocked AND we have cookies, retry authenticated
+  if (result.blocked) {
+    if (FB_COOKIES.length > 0) {
+      console.log('  [blocked anon] Retrying with session cookies...');
+      result = await scrapeWithContext(browser, pageUrl, true);
+      if (result.blocked) {
+        console.log('  [blocked auth] Still blocked — skipping.');
+      }
+    } else {
+      console.log('  [blocked] No cookies available — skipping.');
+    }
+  }
+
+  const lead = {
+    pageUrl,
+    name:     result.name,
+    category: result.category,
+    phone:    result.phone,
+    email:    result.email,
+    website:  result.website,
+    address:  result.address,
+    about:    result.about
+  };
+
+  console.log(`  Name:    ${lead.name    || '—'}`);
+  console.log(`  Phone:   ${lead.phone   || '—'}`);
+  console.log(`  Email:   ${lead.email   || '—'}`);
+  console.log(`  Website: ${lead.website || '—'}`);
+  console.log(`  Address: ${lead.address || '—'}`);
+  if (!lead.email && !lead.phone && !lead.website && !lead.address)
+    console.log('  No contact fields found.');
+
   return lead;
 }
 
@@ -235,24 +239,19 @@ async function main() {
   const pageUrls = await fetchPageUrlsFromSheet(SHEET_READ_URL);
   if (!pageUrls.length) { console.log('No URLs found. Exiting.'); process.exit(0); }
 
-  const mode = FB_COOKIES.length > 0 ? 'authenticated' : 'anonymous';
-  console.log(`Running ${pageUrls.length} page(s) in ${mode} mode...\n`);
+  const hasCookies = FB_COOKIES.length > 0;
+  console.log(`Running ${pageUrls.length} page(s). Strategy: anon-first${ hasCookies ? ', cookie fallback for blocked' : ' (no cookie fallback)' }...\n`);
   await ensureHeaderRow();
 
   const browser = await chromium.launch({
     headless: true,
-    args: [
-      '--disable-blink-features=AutomationControlled',
-      '--no-sandbox',
-      '--disable-setuid-sandbox'
-    ]
+    args: ['--disable-blink-features=AutomationControlled', '--no-sandbox', '--disable-setuid-sandbox']
   });
   let sent = 0;
 
   try {
     for (let i = 0; i < pageUrls.length; i++) {
       const lead = await scrapePage(browser, pageUrls[i]);
-
       try {
         console.log('  Sending to sheet...');
         await appendLeads(SHEET_WEBHOOK_URL, SHEET_TAB, [lead]);
@@ -261,7 +260,6 @@ async function main() {
       } catch (webhookErr) {
         console.warn(`  Webhook error (continuing): ${webhookErr.message.slice(0, 120)}`);
       }
-
       if (i < pageUrls.length - 1) {
         const delay = randomDelay(BETWEEN_PAGE_DELAY_MS);
         console.log(' Waiting ' + Math.round(delay / 1000) + 's before next page...');
