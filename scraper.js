@@ -12,7 +12,7 @@ import { ensureHeaderRow, appendLeads } from './sheets.js';
 const SHEET_WEBHOOK_URL     = process.env.SHEET_WEBHOOK_URL;
 const SHEET_TAB             = process.env.SHEET_TAB || 'FB Leads';
 const BETWEEN_PAGE_DELAY_MS = [5000, 10000];
-const PAGE_LOAD_WAIT_MS     = [5000, 9000];   // extra wait after networkidle
+const PAGE_LOAD_WAIT_MS     = [6000, 10000];  // wait after 'load' for React to render
 const DEBUG = (process.env.DEBUG || '').toLowerCase() === 'true';
 
 // Load Facebook session cookies from secret
@@ -127,11 +127,12 @@ async function scrapePage(browser, rawUrl) {
   try {
     const aboutUrl = pageUrl.includes('profile.php') ? pageUrl : `${pageUrl}/about`;
 
-    // networkidle waits for React to fully render all dynamic content
-    await page.goto(aboutUrl, { waitUntil: 'networkidle', timeout: 60000 });
+    // 'load' = page + scripts fully loaded; Facebook never reaches networkidle
+    // (it constantly makes background requests for ads/analytics)
+    await page.goto(aboutUrl, { waitUntil: 'load', timeout: 45000 });
     await dismissOverlaysIfPresent(page);
 
-    // Extra wait so late-loading React components finish
+    // Wait for React to finish rendering the contact section
     await sleep(randomDelay(PAGE_LOAD_WAIT_MS));
 
     const currentUrl = page.url();
@@ -152,8 +153,8 @@ async function scrapePage(browser, rawUrl) {
       return { title, ogDesc, bodyText, bodyLen: bodyText.length, links };
     });
 
-    // Always log body length — helps diagnose stripped/empty pages
-    console.log(`  [page] body length: ${data.bodyLen} chars`);
+    // Log body length — helps diagnose stripped/empty pages
+    console.log(`  [page] body: ${data.bodyLen} chars`);
 
     lead.name  = data.title || '';
     lead.about = data.ogDesc || '';
@@ -194,7 +195,6 @@ async function scrapePage(browser, rawUrl) {
     const gotAnything = lead.email || lead.phone || lead.website || lead.address;
     if (!gotAnything) {
       console.log('  No contact fields found.');
-      if (DEBUG) console.log(`  (debug) URL=${currentUrl}`);
     }
 
   } catch (err) {
