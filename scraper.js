@@ -1,15 +1,13 @@
 // scraper.js
 // Cloud-hosted Facebook Business Page scraper.
-// Desktop-first scraping. Login used only if fully successful (no checkpoint).
-// Checkpoint cookies are discarded — they make blocking worse.
+// Runs fully anonymously — no login attempt.
+// Login attempts from datacenter IPs flag the IP and increase blocking.
 
 import { chromium } from 'playwright';
 import { ensureHeaderRow, appendLeads } from './sheets.js';
 
 const SHEET_WEBHOOK_URL  = process.env.SHEET_WEBHOOK_URL;
 const SHEET_TAB          = process.env.SHEET_TAB || 'FB Leads';
-const FACEBOOK_EMAIL     = process.env.FACEBOOK_EMAIL;
-const FACEBOOK_PASSWORD  = process.env.FACEBOOK_PASSWORD;
 const BETWEEN_PAGE_DELAY_MS = [4000, 9000];
 const DEBUG = (process.env.DEBUG || '').toLowerCase() === 'true';
 
@@ -34,15 +32,12 @@ function decodeFacebookRedirect(href) {
     return href;
   } catch (_) { return href; }
 }
-
-// Detects ALL Facebook block/redirect patterns
 function isBlocked(url) {
   return (
     url.includes('meta.com') ||
     url.includes('/login') ||
     url.includes('checkpoint') ||
-    url.includes('two_step_verification') ||
-    url.includes('recover')
+    url.includes('two_step_verification')
   );
 }
 
@@ -64,69 +59,15 @@ async function dismissOverlaysIfPresent(page) {
   }
 }
 
-// =============================================
-// FACEBOOK LOGIN
-// Returns cookies ONLY on clean successful login.
-// Discards checkpoint/2FA cookies — they make blocking worse.
-// =============================================
-async function loginToFacebook(browser) {
-  if (!FACEBOOK_EMAIL || !FACEBOOK_PASSWORD) {
-    console.log('No Facebook credentials set — running anonymously.');
-    return [];
-  }
-  console.log('\n=== Logging in to Facebook ===');
-  const context = await browser.newContext({
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    viewport: { width: 1366, height: 900 }, locale: 'en-US'
-  });
-  const page = await context.newPage();
-  try {
-    await page.goto('https://www.facebook.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await dismissOverlaysIfPresent(page);
-    await sleep(2000);
-    console.log('  Filling credentials...');
-    await page.waitForSelector('input[name="email"]', { timeout: 15000 });
-    await page.fill('input[name="email"]', FACEBOOK_EMAIL);
-    await sleep(500);
-    await page.fill('input[type="password"]', FACEBOOK_PASSWORD);
-    await sleep(500);
-    await page.keyboard.press('Enter');
-    await page.waitForTimeout(6000);
-    const url = page.url();
-    console.log('  Post-login URL: ' + url.split('?')[0]);
-
-    if (isBlocked(url)) {
-      // Checkpoint/2FA/block — discard cookies, run anonymously
-      console.log('  Checkpoint detected — discarding cookies, running anonymously.');
-      console.log('  (Checkpoint cookies make scraping worse — cleaner without them)');
-      await context.close();
-      return [];
-    }
-
-    // Truly logged in — safe to use cookies
-    const cookies = await context.cookies(['https://www.facebook.com']);
-    console.log('  Login successful! Saved ' + cookies.length + ' cookies.');
-    await context.close();
-    return cookies;
-  } catch (err) {
-    console.log('  Login error: ' + err.message.slice(0, 120));
-    await context.close();
-    return [];
-  }
-}
-
-// =============================================
-// SCRAPE ONE PAGE — desktop primary
-// =============================================
-async function scrapePage(browser, rawUrl, fbCookies = []) {
+async function scrapePage(browser, rawUrl) {
   const pageUrl = normalizePageUrl(rawUrl);
   console.log(`\n--- Scraping: ${pageUrl} ---`);
 
   const context = await browser.newContext({
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    viewport: { width: 1366, height: 900 }, locale: 'en-US'
+    viewport: { width: 1366, height: 900 },
+    locale: 'en-US'
   });
-  if (fbCookies.length > 0) await context.addCookies(fbCookies);
 
   const page = await context.newPage();
   const lead = { pageUrl, name: '', category: '', phone: '', email: '', website: '', address: '', about: '' };
@@ -155,12 +96,10 @@ async function scrapePage(browser, rawUrl, fbCookies = []) {
     lead.name  = data.title || '';
     lead.about = data.ogDesc || '';
 
-    // Email
     const emailRegex = /([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})/g;
     lead.email = (data.bodyText.match(emailRegex) || [])
       .find(e => !e.toLowerCase().endsWith('.png') && !e.includes('sentry') && !e.includes('facebook')) || '';
 
-    // Phone
     const phoneSectionMatch = data.bodyText.match(/Phone number\s*\n?\s*([+()\d][\d\s().-]{6,}\d)/i);
     if (phoneSectionMatch) {
       lead.phone = phoneSectionMatch[1].trim();
@@ -169,15 +108,12 @@ async function scrapePage(browser, rawUrl, fbCookies = []) {
       lead.phone = (data.bodyText.match(phoneRegex) || [])[0] || '';
     }
 
-    // Address
     const addressMatch = data.bodyText.match(/Address\s*\n?\s*([^\n]{5,120})/i);
     if (addressMatch) lead.address = addressMatch[1].trim();
 
-    // Category
     const categoryMatch = data.bodyText.match(/\n(Restaurant|Local Business|Shopping & Retail|Product\/Service|Professional Service|Health\/Beauty|Home Improvement|Real Estate|Automotive|Medical & Health|Education|Contractor|Plumbing Service|Roofing Contractor)\n/i);
     if (categoryMatch) lead.category = categoryMatch[1];
 
-    // Website
     const excludedHosts = ['facebook.com', 'fb.com', 'fb.me', 'instagram.com', 'messenger.com'];
     for (const link of data.links) {
       const resolved = decodeFacebookRedirect(link.href);
@@ -237,22 +173,15 @@ async function main() {
   const pageUrls = await fetchPageUrlsFromSheet(SHEET_READ_URL);
   if (!pageUrls.length) { console.log('No URLs found. Exiting.'); process.exit(0); }
 
-  console.log('Running ' + pageUrls.length + ' page(s)...\n');
+  console.log('Running ' + pageUrls.length + ' page(s) anonymously (no login)...\n');
   await ensureHeaderRow();
 
-  const browser   = await chromium.launch({ headless: true });
-  const fbCookies = await loginToFacebook(browser);
-
-  if (fbCookies.length > 0) {
-    console.log('Running WITH authenticated session cookies.\n');
-  } else {
-    console.log('Running ANONYMOUSLY (no valid session).\n');
-  }
-
+  const browser = await chromium.launch({ headless: true });
   let sent = 0;
+
   try {
     for (let i = 0; i < pageUrls.length; i++) {
-      const lead = await scrapePage(browser, pageUrls[i], fbCookies);
+      const lead = await scrapePage(browser, pageUrls[i]);
 
       console.log('  Sending to sheet...');
       await appendLeads(SHEET_WEBHOOK_URL, SHEET_TAB, [lead]);
