@@ -1,6 +1,9 @@
 // scraper.js
 // Cloud-hosted Facebook Business Page scraper.
 // Uses session cookies injected via FACEBOOK_COOKIES secret for authenticated access.
+// Accepts TWO formats:
+//   1. JSON array  (Cookie-Editor export)
+//   2. Raw string  (paste the Cookie header value from Chrome DevTools Network tab)
 // Falls back to anonymous scraping if no cookies provided.
 
 import { chromium } from 'playwright';
@@ -11,26 +14,37 @@ const SHEET_TAB          = process.env.SHEET_TAB || 'FB Leads';
 const BETWEEN_PAGE_DELAY_MS = [4000, 9000];
 const DEBUG = (process.env.DEBUG || '').toLowerCase() === 'true';
 
-// Load Facebook session cookies from secret (exported from Chrome while logged in)
+// Load Facebook session cookies from secret
 let FB_COOKIES = [];
 try {
-  const raw = process.env.FACEBOOK_COOKIES || '[]';
-  const parsed = JSON.parse(raw);
-  // Normalize: handle Cookie-Editor format (expirationDate) AND Playwright format (expires)
-  FB_COOKIES = parsed.map(c => ({
-    name:     c.name,
-    value:    c.value,
-    domain:   c.domain ? (c.domain.startsWith('.') ? c.domain : '.' + c.domain.replace(/^\./, '')) : '.facebook.com',
-    path:     c.path || '/',
-    httpOnly: !!c.httpOnly,
-    secure:   !!c.secure,
-    sameSite: c.sameSite || 'None',
-    expires:  c.expires ?? c.expirationDate ?? -1
-  }));
-  if (FB_COOKIES.length > 0) {
-    console.log(`[auth] Loaded ${FB_COOKIES.length} session cookies — authenticated mode.`);
-  } else {
+  const raw = (process.env.FACEBOOK_COOKIES || '').trim();
+  if (!raw || raw === '[]') {
     console.log('[auth] No FACEBOOK_COOKIES set — running anonymous.');
+  } else if (raw.startsWith('[')) {
+    // --- Format 1: JSON array (Cookie-Editor export) ---
+    const parsed = JSON.parse(raw);
+    FB_COOKIES = parsed.map(c => ({
+      name:     c.name,
+      value:    c.value,
+      domain:   c.domain ? (c.domain.startsWith('.') ? c.domain : '.' + c.domain) : '.facebook.com',
+      path:     c.path || '/',
+      httpOnly: !!c.httpOnly,
+      secure:   !!c.secure,
+      sameSite: c.sameSite || 'None',
+      expires:  c.expires ?? c.expirationDate ?? -1
+    }));
+    console.log(`[auth] Loaded ${FB_COOKIES.length} cookies (JSON) — authenticated mode.`);
+  } else {
+    // --- Format 2: Raw cookie string (copy Cookie header from Chrome DevTools Network tab) ---
+    FB_COOKIES = raw.split(';').map(pair => {
+      const eqIdx = pair.indexOf('=');
+      if (eqIdx === -1) return null;
+      const name  = pair.slice(0, eqIdx).trim();
+      const value = pair.slice(eqIdx + 1).trim();
+      if (!name) return null;
+      return { name, value, domain: '.facebook.com', path: '/', secure: true, sameSite: 'None' };
+    }).filter(Boolean);
+    console.log(`[auth] Loaded ${FB_COOKIES.length} cookies (raw string) — authenticated mode.`);
   }
 } catch (e) {
   console.warn('[auth] Could not parse FACEBOOK_COOKIES — running anonymous. Error:', e.message);
