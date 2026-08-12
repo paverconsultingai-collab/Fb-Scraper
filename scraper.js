@@ -9,9 +9,10 @@
 import { chromium } from 'playwright';
 import { ensureHeaderRow, appendLeads } from './sheets.js';
 
-const SHEET_WEBHOOK_URL  = process.env.SHEET_WEBHOOK_URL;
-const SHEET_TAB          = process.env.SHEET_TAB || 'FB Leads';
-const BETWEEN_PAGE_DELAY_MS = [4000, 9000];
+const SHEET_WEBHOOK_URL     = process.env.SHEET_WEBHOOK_URL;
+const SHEET_TAB             = process.env.SHEET_TAB || 'FB Leads';
+const BETWEEN_PAGE_DELAY_MS = [5000, 10000];
+const PAGE_LOAD_WAIT_MS     = [5000, 9000];   // extra wait after networkidle
 const DEBUG = (process.env.DEBUG || '').toLowerCase() === 'true';
 
 // Load Facebook session cookies from secret
@@ -21,7 +22,6 @@ try {
   if (!raw || raw === '[]') {
     console.log('[auth] No FACEBOOK_COOKIES set — running anonymous.');
   } else if (raw.startsWith('[')) {
-    // --- Format 1: JSON array (Cookie-Editor export) ---
     const parsed = JSON.parse(raw);
     FB_COOKIES = parsed.map(c => ({
       name:     c.name,
@@ -35,7 +35,6 @@ try {
     }));
     console.log(`[auth] Loaded ${FB_COOKIES.length} cookies (JSON) — authenticated mode.`);
   } else {
-    // --- Format 2: Raw cookie string (copy Cookie header from Chrome DevTools Network tab) ---
     FB_COOKIES = raw.split(';').map(pair => {
       const eqIdx = pair.indexOf('=');
       if (eqIdx === -1) return null;
@@ -104,8 +103,17 @@ async function scrapePage(browser, rawUrl) {
 
   const context = await browser.newContext({
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    viewport: { width: 1366, height: 900 },
-    locale: 'en-US'
+    viewport:  { width: 1440, height: 900 },
+    locale:    'en-US',
+    extraHTTPHeaders: { 'Accept-Language': 'en-US,en;q=0.9' }
+  });
+
+  // Hide automation fingerprint so Facebook serves full content
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, 'webdriver',  { get: () => false });
+    Object.defineProperty(navigator, 'languages',  { get: () => ['en-US', 'en'] });
+    Object.defineProperty(navigator, 'plugins',    { get: () => [1, 2, 3, 4, 5] });
+    window.chrome = { runtime: {} };
   });
 
   // Inject session cookies so requests appear authenticated
@@ -118,9 +126,13 @@ async function scrapePage(browser, rawUrl) {
 
   try {
     const aboutUrl = pageUrl.includes('profile.php') ? pageUrl : `${pageUrl}/about`;
-    await page.goto(aboutUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+
+    // networkidle waits for React to fully render all dynamic content
+    await page.goto(aboutUrl, { waitUntil: 'networkidle', timeout: 60000 });
     await dismissOverlaysIfPresent(page);
-    await sleep(randomDelay([2500, 4500]));
+
+    // Extra wait so late-loading React components finish
+    await sleep(randomDelay(PAGE_LOAD_WAIT_MS));
 
     const currentUrl = page.url();
     if (isBlocked(currentUrl)) {
@@ -130,12 +142,18 @@ async function scrapePage(browser, rawUrl) {
     }
 
     const data = await page.evaluate(() => {
-      const title = document.title.replace(/\s*\|\s*Facebook\s*$/i, '').trim();
-      const ogDesc = document.querySelector('meta[property="og:description"]')?.content || '';
+      const title   = document.title.replace(/\s*\|\s*Facebook\s*$/i, '').trim();
+      const ogDesc  = document.querySelector('meta[property="og:description"]')?.content || '';
       const bodyText = document.body ? document.body.innerText || '' : '';
-      const links = [...document.querySelectorAll('a[href]')].map(a => ({ href: a.href, text: (a.innerText || '').trim() }));
-      return { title, ogDesc, bodyText, links };
+      const links   = [...document.querySelectorAll('a[href]')].map(a => ({
+        href: a.href,
+        text: (a.innerText || '').trim()
+      }));
+      return { title, ogDesc, bodyText, bodyLen: bodyText.length, links };
     });
+
+    // Always log body length — helps diagnose stripped/empty pages
+    console.log(`  [page] body length: ${data.bodyLen} chars`);
 
     lead.name  = data.title || '';
     lead.about = data.ogDesc || '';
@@ -176,7 +194,7 @@ async function scrapePage(browser, rawUrl) {
     const gotAnything = lead.email || lead.phone || lead.website || lead.address;
     if (!gotAnything) {
       console.log('  No contact fields found.');
-      if (DEBUG) console.log(`  (debug) URL=${currentUrl} len=${data.bodyText.length}`);
+      if (DEBUG) console.log(`  (debug) URL=${currentUrl}`);
     }
 
   } catch (err) {
@@ -221,14 +239,20 @@ async function main() {
   console.log(`Running ${pageUrls.length} page(s) in ${mode} mode...\n`);
   await ensureHeaderRow();
 
-  const browser = await chromium.launch({ headless: true });
+  const browser = await chromium.launch({
+    headless: true,
+    args: [
+      '--disable-blink-features=AutomationControlled',
+      '--no-sandbox',
+      '--disable-setuid-sandbox'
+    ]
+  });
   let sent = 0;
 
   try {
     for (let i = 0; i < pageUrls.length; i++) {
       const lead = await scrapePage(browser, pageUrls[i]);
 
-      // Wrap webhook call — a single failed send should never kill the whole run
       try {
         console.log('  Sending to sheet...');
         await appendLeads(SHEET_WEBHOOK_URL, SHEET_TAB, [lead]);
