@@ -15,7 +15,18 @@ const DEBUG = (process.env.DEBUG || '').toLowerCase() === 'true';
 let FB_COOKIES = [];
 try {
   const raw = process.env.FACEBOOK_COOKIES || '[]';
-  FB_COOKIES = JSON.parse(raw);
+  const parsed = JSON.parse(raw);
+  // Normalize: handle Cookie-Editor format (expirationDate) AND Playwright format (expires)
+  FB_COOKIES = parsed.map(c => ({
+    name:     c.name,
+    value:    c.value,
+    domain:   c.domain ? (c.domain.startsWith('.') ? c.domain : '.' + c.domain.replace(/^\./, '')) : '.facebook.com',
+    path:     c.path || '/',
+    httpOnly: !!c.httpOnly,
+    secure:   !!c.secure,
+    sameSite: c.sameSite || 'None',
+    expires:  c.expires ?? c.expirationDate ?? -1
+  }));
   if (FB_COOKIES.length > 0) {
     console.log(`[auth] Loaded ${FB_COOKIES.length} session cookies — authenticated mode.`);
   } else {
