@@ -1,7 +1,7 @@
 // scraper.js
 // Cloud-hosted Facebook Business Page scraper.
-// Runs fully anonymously — no login attempt.
-// Login attempts from datacenter IPs flag the IP and increase blocking.
+// Uses session cookies injected via FACEBOOK_COOKIES secret for authenticated access.
+// Falls back to anonymous scraping if no cookies provided.
 
 import { chromium } from 'playwright';
 import { ensureHeaderRow, appendLeads } from './sheets.js';
@@ -10,6 +10,20 @@ const SHEET_WEBHOOK_URL  = process.env.SHEET_WEBHOOK_URL;
 const SHEET_TAB          = process.env.SHEET_TAB || 'FB Leads';
 const BETWEEN_PAGE_DELAY_MS = [4000, 9000];
 const DEBUG = (process.env.DEBUG || '').toLowerCase() === 'true';
+
+// Load Facebook session cookies from secret (exported from Chrome while logged in)
+let FB_COOKIES = [];
+try {
+  const raw = process.env.FACEBOOK_COOKIES || '[]';
+  FB_COOKIES = JSON.parse(raw);
+  if (FB_COOKIES.length > 0) {
+    console.log(`[auth] Loaded ${FB_COOKIES.length} session cookies — authenticated mode.`);
+  } else {
+    console.log('[auth] No FACEBOOK_COOKIES set — running anonymous.');
+  }
+} catch (e) {
+  console.warn('[auth] Could not parse FACEBOOK_COOKIES — running anonymous. Error:', e.message);
+}
 
 function randomDelay([min, max]) {
   return min + Math.floor(Math.random() * (max - min));
@@ -68,6 +82,11 @@ async function scrapePage(browser, rawUrl) {
     viewport: { width: 1366, height: 900 },
     locale: 'en-US'
   });
+
+  // Inject session cookies so requests appear authenticated
+  if (FB_COOKIES.length > 0) {
+    await context.addCookies(FB_COOKIES);
+  }
 
   const page = await context.newPage();
   const lead = { pageUrl, name: '', category: '', phone: '', email: '', website: '', address: '', about: '' };
@@ -173,7 +192,8 @@ async function main() {
   const pageUrls = await fetchPageUrlsFromSheet(SHEET_READ_URL);
   if (!pageUrls.length) { console.log('No URLs found. Exiting.'); process.exit(0); }
 
-  console.log('Running ' + pageUrls.length + ' page(s) anonymously (no login)...\n');
+  const mode = FB_COOKIES.length > 0 ? 'authenticated' : 'anonymous';
+  console.log(`Running ${pageUrls.length} page(s) in ${mode} mode...\n`);
   await ensureHeaderRow();
 
   const browser = await chromium.launch({ headless: true });
