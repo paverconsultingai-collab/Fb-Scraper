@@ -73,13 +73,13 @@ async function loginToFacebook(browser) {
     await sleep(2000);
 
     console.log('  Filling credentials...');
-    // Wait for the email field to be present before filling
     await page.waitForSelector('input[name="email"]', { timeout: 15000 });
     await page.fill('input[name="email"]', FACEBOOK_EMAIL);
     await sleep(500);
     await page.fill('input[type="password"]', FACEBOOK_PASSWORD);
     await sleep(500);
-    await page.click('button[name="login"]');
+    // Press Enter to submit — works regardless of button selector
+    await page.keyboard.press('Enter');
 
     await page.waitForTimeout(6000);
     const url = page.url();
