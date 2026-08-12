@@ -1,0 +1,42 @@
+name: Scrape FB Business Pages to Sheet
+
+on:
+  workflow_dispatch:
+    inputs:
+      page_urls:
+        description: 'Facebook Page URLs (one per line or |-separated)'
+        required: true
+        type: string
+      debug:
+        description: 'Enable debug logging'
+        required: false
+        default: 'false'
+        type: string
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browser
+        run: npx playwright install chromium --with-deps
+
+      - name: Run scraper
+        env:
+          PAGE_URLS: ${{ github.event.inputs.page_urls }}
+          SHEET_WEBHOOK_URL: ${{ secrets.SHEET_WEBHOOK_URL }}
+          SHEET_TAB: ${{ vars.FB_SHEET_TAB || 'FB Leads' }}
+          DEBUG: ${{ github.event.inputs.debug }}
+        run: npm run scrape
