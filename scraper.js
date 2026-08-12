@@ -183,10 +183,15 @@ async function main() {
     for (let i = 0; i < pageUrls.length; i++) {
       const lead = await scrapePage(browser, pageUrls[i]);
 
-      console.log('  Sending to sheet...');
-      await appendLeads(SHEET_WEBHOOK_URL, SHEET_TAB, [lead]);
-      sent++;
-      console.log(`  Sent to sheet OK (${sent}/${pageUrls.length})`);
+      // Wrap webhook call — a single failed send should never kill the whole run
+      try {
+        console.log('  Sending to sheet...');
+        await appendLeads(SHEET_WEBHOOK_URL, SHEET_TAB, [lead]);
+        sent++;
+        console.log(`  Sent to sheet OK (${sent}/${pageUrls.length})`);
+      } catch (webhookErr) {
+        console.warn(`  Webhook error (continuing): ${webhookErr.message.slice(0, 120)}`);
+      }
 
       if (i < pageUrls.length - 1) {
         const delay = randomDelay(BETWEEN_PAGE_DELAY_MS);
