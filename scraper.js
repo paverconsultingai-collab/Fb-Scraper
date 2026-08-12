@@ -1,7 +1,7 @@
 // scraper.js
 // Cloud-hosted Facebook Business Page scraper.
-// Uses mbasic.facebook.com as PRIMARY — bypasses desktop bot detection.
-// Falls back to desktop if mbasic is also blocked.
+// Desktop-first scraping. Login used only if fully successful (no checkpoint).
+// Checkpoint cookies are discarded — they make blocking worse.
 
 import { chromium } from 'playwright';
 import { ensureHeaderRow, appendLeads } from './sheets.js';
@@ -25,11 +25,6 @@ function normalizePageUrl(rawUrl) {
   if (!url.includes('profile.php')) url = url.split('?')[0].replace(/\/+$/, '');
   return url;
 }
-function toMbasicUrl(pageUrl) {
-  return pageUrl
-    .replace('www.facebook.com', 'mbasic.facebook.com')
-    .replace('m.facebook.com',   'mbasic.facebook.com');
-}
 function decodeFacebookRedirect(href) {
   try {
     const parsed = new URL(href);
@@ -38,6 +33,17 @@ function decodeFacebookRedirect(href) {
     }
     return href;
   } catch (_) { return href; }
+}
+
+// Detects ALL Facebook block/redirect patterns
+function isBlocked(url) {
+  return (
+    url.includes('meta.com') ||
+    url.includes('/login') ||
+    url.includes('checkpoint') ||
+    url.includes('two_step_verification') ||
+    url.includes('recover')
+  );
 }
 
 async function dismissOverlaysIfPresent(page) {
@@ -58,49 +64,14 @@ async function dismissOverlaysIfPresent(page) {
   }
 }
 
-function isBlocked(url) {
-  return url.includes('meta.com') || url.includes('/login') || url.includes('checkpoint');
-}
-
-function extractLeadData(bodyText, links, pageUrl) {
-  const lead = { pageUrl, name: '', category: '', phone: '', email: '', website: '', address: '', about: '' };
-
-  const emailRegex = /([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})/g;
-  lead.email = (bodyText.match(emailRegex) || [])
-    .find(e => !e.toLowerCase().endsWith('.png') && !e.includes('sentry') && !e.includes('facebook')) || '';
-
-  const phoneSectionMatch = bodyText.match(/Phone number\s*\n?\s*([+()\d][\d\s().-]{6,}\d)/i);
-  if (phoneSectionMatch) {
-    lead.phone = phoneSectionMatch[1].trim();
-  } else {
-    const phoneRegex = /(\+?\d[\d ()\-.\u00A0]{7,}\d)/g;
-    lead.phone = (bodyText.match(phoneRegex) || [])[0] || '';
-  }
-
-  const addressMatch = bodyText.match(/Address\s*\n?\s*([^\n]{5,120})/i);
-  if (addressMatch) lead.address = addressMatch[1].trim();
-
-  const categoryMatch = bodyText.match(/\n(Restaurant|Local Business|Shopping & Retail|Product\/Service|Professional Service|Health\/Beauty|Home Improvement|Real Estate|Automotive|Medical & Health|Education|Contractor|Plumbing Service|Roofing Contractor)\n/i);
-  if (categoryMatch) lead.category = categoryMatch[1];
-
-  const excludedHosts = ['facebook.com', 'fb.com', 'fb.me', 'instagram.com', 'messenger.com', 'mbasic.'];
-  for (const link of links) {
-    const resolved = decodeFacebookRedirect(link.href);
-    try {
-      const host = new URL(resolved).hostname.replace('www.', '');
-      if (!excludedHosts.some(h => host.includes(h))) { lead.website = resolved; break; }
-    } catch (_) {}
-  }
-
-  return lead;
-}
-
 // =============================================
 // FACEBOOK LOGIN
+// Returns cookies ONLY on clean successful login.
+// Discards checkpoint/2FA cookies — they make blocking worse.
 // =============================================
 async function loginToFacebook(browser) {
   if (!FACEBOOK_EMAIL || !FACEBOOK_PASSWORD) {
-    console.log('No Facebook credentials set.');
+    console.log('No Facebook credentials set — running anonymously.');
     return [];
   }
   console.log('\n=== Logging in to Facebook ===');
@@ -123,36 +94,37 @@ async function loginToFacebook(browser) {
     await page.waitForTimeout(6000);
     const url = page.url();
     console.log('  Post-login URL: ' + url.split('?')[0]);
+
     if (isBlocked(url)) {
-      console.log('  WARNING: Blocked by Facebook checkpoint (datacenter IP). Scraping continues without login.');
-    } else {
-      console.log('  Login successful!');
+      // Checkpoint/2FA/block — discard cookies, run anonymously
+      console.log('  Checkpoint detected — discarding cookies, running anonymously.');
+      console.log('  (Checkpoint cookies make scraping worse — cleaner without them)');
+      await context.close();
+      return [];
     }
-    const cookies = await context.cookies(['https://www.facebook.com', 'https://mbasic.facebook.com']);
-    console.log('  Saved ' + cookies.length + ' cookies.');
+
+    // Truly logged in — safe to use cookies
+    const cookies = await context.cookies(['https://www.facebook.com']);
+    console.log('  Login successful! Saved ' + cookies.length + ' cookies.');
     await context.close();
     return cookies;
   } catch (err) {
-    console.log('  Login error: ' + err.message.slice(0, 100));
+    console.log('  Login error: ' + err.message.slice(0, 120));
     await context.close();
     return [];
   }
 }
 
 // =============================================
-// SCRAPE ONE PAGE
-// mbasic.facebook.com PRIMARY, desktop FALLBACK
+// SCRAPE ONE PAGE — desktop primary
 // =============================================
 async function scrapePage(browser, rawUrl, fbCookies = []) {
-  const pageUrl   = normalizePageUrl(rawUrl);
-  const mbasicUrl = toMbasicUrl(pageUrl);
+  const pageUrl = normalizePageUrl(rawUrl);
   console.log(`\n--- Scraping: ${pageUrl} ---`);
 
-  // Mobile user-agent for mbasic
   const context = await browser.newContext({
-    userAgent: 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
-    viewport: { width: 390, height: 844 },
-    locale: 'en-US'
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    viewport: { width: 1366, height: 900 }, locale: 'en-US'
   });
   if (fbCookies.length > 0) await context.addCookies(fbCookies);
 
@@ -160,27 +132,14 @@ async function scrapePage(browser, rawUrl, fbCookies = []) {
   const lead = { pageUrl, name: '', category: '', phone: '', email: '', website: '', address: '', about: '' };
 
   try {
-    // 1. Try mbasic
-    const aboutUrl = mbasicUrl.includes('profile.php') ? mbasicUrl : `${mbasicUrl}/about`;
-    console.log('  Trying mbasic: ' + aboutUrl);
+    const aboutUrl = pageUrl.includes('profile.php') ? pageUrl : `${pageUrl}/about`;
     await page.goto(aboutUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
     await dismissOverlaysIfPresent(page);
-    await sleep(randomDelay([1500, 3000]));
+    await sleep(randomDelay([2500, 4500]));
 
-    let currentUrl = page.url();
-
-    // 2. If mbasic blocked, try desktop fallback
+    const currentUrl = page.url();
     if (isBlocked(currentUrl)) {
-      console.log('  mbasic blocked — trying desktop fallback...');
-      const desktopAbout = pageUrl.includes('profile.php') ? pageUrl : `${pageUrl}/about`;
-      await page.goto(desktopAbout, { waitUntil: 'domcontentloaded', timeout: 45000 });
-      await sleep(randomDelay([2000, 4000]));
-      currentUrl = page.url();
-    }
-
-    // 3. Both blocked — skip
-    if (isBlocked(currentUrl)) {
-      console.log('  Both mbasic + desktop blocked — skipping.');
+      console.log('  Blocked (' + currentUrl.split('/')[2] + ') — skipping.');
       await context.close();
       return lead;
     }
@@ -195,12 +154,38 @@ async function scrapePage(browser, rawUrl, fbCookies = []) {
 
     lead.name  = data.title || '';
     lead.about = data.ogDesc || '';
-    const ex = extractLeadData(data.bodyText, data.links, pageUrl);
-    lead.email    = ex.email;
-    lead.phone    = ex.phone;
-    lead.address  = ex.address;
-    lead.website  = ex.website;
-    lead.category = ex.category;
+
+    // Email
+    const emailRegex = /([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})/g;
+    lead.email = (data.bodyText.match(emailRegex) || [])
+      .find(e => !e.toLowerCase().endsWith('.png') && !e.includes('sentry') && !e.includes('facebook')) || '';
+
+    // Phone
+    const phoneSectionMatch = data.bodyText.match(/Phone number\s*\n?\s*([+()\d][\d\s().-]{6,}\d)/i);
+    if (phoneSectionMatch) {
+      lead.phone = phoneSectionMatch[1].trim();
+    } else {
+      const phoneRegex = /(\+?\d[\d ()\-.\u00A0]{7,}\d)/g;
+      lead.phone = (data.bodyText.match(phoneRegex) || [])[0] || '';
+    }
+
+    // Address
+    const addressMatch = data.bodyText.match(/Address\s*\n?\s*([^\n]{5,120})/i);
+    if (addressMatch) lead.address = addressMatch[1].trim();
+
+    // Category
+    const categoryMatch = data.bodyText.match(/\n(Restaurant|Local Business|Shopping & Retail|Product\/Service|Professional Service|Health\/Beauty|Home Improvement|Real Estate|Automotive|Medical & Health|Education|Contractor|Plumbing Service|Roofing Contractor)\n/i);
+    if (categoryMatch) lead.category = categoryMatch[1];
+
+    // Website
+    const excludedHosts = ['facebook.com', 'fb.com', 'fb.me', 'instagram.com', 'messenger.com'];
+    for (const link of data.links) {
+      const resolved = decodeFacebookRedirect(link.href);
+      try {
+        const host = new URL(resolved).hostname.replace('www.', '');
+        if (!excludedHosts.some(h => host.includes(h))) { lead.website = resolved; break; }
+      } catch (_) {}
+    }
 
     console.log(`  Name:    ${lead.name    || '—'}`);
     console.log(`  Phone:   ${lead.phone   || '—'}`);
@@ -255,10 +240,16 @@ async function main() {
   console.log('Running ' + pageUrls.length + ' page(s)...\n');
   await ensureHeaderRow();
 
-  const browser    = await chromium.launch({ headless: true });
-  const fbCookies  = await loginToFacebook(browser);
-  let sent = 0;
+  const browser   = await chromium.launch({ headless: true });
+  const fbCookies = await loginToFacebook(browser);
 
+  if (fbCookies.length > 0) {
+    console.log('Running WITH authenticated session cookies.\n');
+  } else {
+    console.log('Running ANONYMOUSLY (no valid session).\n');
+  }
+
+  let sent = 0;
   try {
     for (let i = 0; i < pageUrls.length; i++) {
       const lead = await scrapePage(browser, pageUrls[i], fbCookies);
