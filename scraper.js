@@ -242,7 +242,7 @@ async function main() {
     const startIndex = parseInt(process.env.START_INDEX || '0', 10);
     const batchUrls = allPageUrls.slice(startIndex, startIndex + BATCH_SIZE);
     const nextIndex = startIndex + BATCH_SIZE;
-    const hasMore = nextIndex < allPageUrls.length;
+        const hasMore = allPageUrls.length >= BATCH_SIZE;
 
   const hasCookies = FB_COOKIES.length > 0;
   console.log(`Running ${batchUrls.length} page(s). Strategy: anon-first${ hasCookies ? ', cookie fallback for blocked' : ' (no cookie fallback)' }...\n`);
@@ -281,12 +281,12 @@ async function main() {
           const ghToken = process.env.GITHUB_TOKEN;
           const ghRepo  = process.env.GITHUB_REPOSITORY;
           if (ghToken && ghRepo) {
-                  console.log(`Triggering next batch (start_index=${nextIndex})...`);
+                                console.log('Triggering next batch...');
                   const res = await fetch(
                             `https://api.github.com/repos/${ghRepo}/actions/workflows/scrape.yml/dispatches`,
                             { method: 'POST',
                                        headers: { 'Authorization': `Bearer ${ghToken}`, 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json' },
-                                       body: JSON.stringify({ ref: 'main', inputs: { start_index: String(nextIndex), debug: process.env.DEBUG || 'false' } })
+                                                              body: JSON.stringify({ ref: 'main' })
                             }
                           );
                   if (res.ok || res.status === 204) {
