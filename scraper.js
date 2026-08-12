@@ -1,6 +1,7 @@
 // scraper.js
-// Personal, cloud-hosted Facebook Business Page scraper.
-// Logs into Facebook before scraping to avoid meta.com redirects.
+// Cloud-hosted Facebook Business Page scraper.
+// Uses mbasic.facebook.com as PRIMARY — bypasses desktop bot detection.
+// Falls back to desktop if mbasic is also blocked.
 
 import { chromium } from 'playwright';
 import { ensureHeaderRow, appendLeads } from './sheets.js';
@@ -21,8 +22,13 @@ function sleep(ms) {
 function normalizePageUrl(rawUrl) {
   let url = rawUrl.trim();
   if (!url.startsWith('http')) url = `https://${url}`;
-  url = url.split('?')[0].replace(/\/+$/, '');
+  if (!url.includes('profile.php')) url = url.split('?')[0].replace(/\/+$/, '');
   return url;
+}
+function toMbasicUrl(pageUrl) {
+  return pageUrl
+    .replace('www.facebook.com', 'mbasic.facebook.com')
+    .replace('m.facebook.com',   'mbasic.facebook.com');
 }
 function decodeFacebookRedirect(href) {
   try {
@@ -52,53 +58,82 @@ async function dismissOverlaysIfPresent(page) {
   }
 }
 
+function isBlocked(url) {
+  return url.includes('meta.com') || url.includes('/login') || url.includes('checkpoint');
+}
+
+function extractLeadData(bodyText, links, pageUrl) {
+  const lead = { pageUrl, name: '', category: '', phone: '', email: '', website: '', address: '', about: '' };
+
+  const emailRegex = /([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})/g;
+  lead.email = (bodyText.match(emailRegex) || [])
+    .find(e => !e.toLowerCase().endsWith('.png') && !e.includes('sentry') && !e.includes('facebook')) || '';
+
+  const phoneSectionMatch = bodyText.match(/Phone number\s*\n?\s*([+()\d][\d\s().-]{6,}\d)/i);
+  if (phoneSectionMatch) {
+    lead.phone = phoneSectionMatch[1].trim();
+  } else {
+    const phoneRegex = /(\+?\d[\d ()\-.\u00A0]{7,}\d)/g;
+    lead.phone = (bodyText.match(phoneRegex) || [])[0] || '';
+  }
+
+  const addressMatch = bodyText.match(/Address\s*\n?\s*([^\n]{5,120})/i);
+  if (addressMatch) lead.address = addressMatch[1].trim();
+
+  const categoryMatch = bodyText.match(/\n(Restaurant|Local Business|Shopping & Retail|Product\/Service|Professional Service|Health\/Beauty|Home Improvement|Real Estate|Automotive|Medical & Health|Education|Contractor|Plumbing Service|Roofing Contractor)\n/i);
+  if (categoryMatch) lead.category = categoryMatch[1];
+
+  const excludedHosts = ['facebook.com', 'fb.com', 'fb.me', 'instagram.com', 'messenger.com', 'mbasic.'];
+  for (const link of links) {
+    const resolved = decodeFacebookRedirect(link.href);
+    try {
+      const host = new URL(resolved).hostname.replace('www.', '');
+      if (!excludedHosts.some(h => host.includes(h))) { lead.website = resolved; break; }
+    } catch (_) {}
+  }
+
+  return lead;
+}
+
 // =============================================
-// FACEBOOK LOGIN — runs once, returns cookies
+// FACEBOOK LOGIN
 // =============================================
 async function loginToFacebook(browser) {
   if (!FACEBOOK_EMAIL || !FACEBOOK_PASSWORD) {
-    console.log('No Facebook credentials set — skipping login.');
+    console.log('No Facebook credentials set.');
     return [];
   }
   console.log('\n=== Logging in to Facebook ===');
   const context = await browser.newContext({
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    viewport: { width: 1366, height: 900 },
-    locale: 'en-US'
+    viewport: { width: 1366, height: 900 }, locale: 'en-US'
   });
   const page = await context.newPage();
   try {
     await page.goto('https://www.facebook.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
     await dismissOverlaysIfPresent(page);
     await sleep(2000);
-
     console.log('  Filling credentials...');
     await page.waitForSelector('input[name="email"]', { timeout: 15000 });
     await page.fill('input[name="email"]', FACEBOOK_EMAIL);
     await sleep(500);
     await page.fill('input[type="password"]', FACEBOOK_PASSWORD);
     await sleep(500);
-    // Press Enter to submit — works regardless of button selector
     await page.keyboard.press('Enter');
-
     await page.waitForTimeout(6000);
     const url = page.url();
-    console.log('  Post-login URL: ' + url);
-
-    if (url.includes('checkpoint') || url.includes('two_step_verification')) {
-      console.log('  WARNING: Facebook checkpoint detected — 2FA or unusual login.');
-    } else if (url.includes('login')) {
-      console.log('  WARNING: Still on login page — credentials may be wrong or blocked.');
+    console.log('  Post-login URL: ' + url.split('?')[0]);
+    if (isBlocked(url)) {
+      console.log('  WARNING: Blocked by Facebook checkpoint (datacenter IP). Scraping continues without login.');
     } else {
       console.log('  Login successful!');
     }
-
-    const cookies = await context.cookies(['https://www.facebook.com']);
-    console.log('  Saved ' + cookies.length + ' session cookies.');
+    const cookies = await context.cookies(['https://www.facebook.com', 'https://mbasic.facebook.com']);
+    console.log('  Saved ' + cookies.length + ' cookies.');
     await context.close();
     return cookies;
   } catch (err) {
-    console.log('  Login error: ' + err.message);
+    console.log('  Login error: ' + err.message.slice(0, 100));
     await context.close();
     return [];
   }
@@ -106,74 +141,66 @@ async function loginToFacebook(browser) {
 
 // =============================================
 // SCRAPE ONE PAGE
+// mbasic.facebook.com PRIMARY, desktop FALLBACK
 // =============================================
 async function scrapePage(browser, rawUrl, fbCookies = []) {
-  const pageUrl = normalizePageUrl(rawUrl);
+  const pageUrl   = normalizePageUrl(rawUrl);
+  const mbasicUrl = toMbasicUrl(pageUrl);
   console.log(`\n--- Scraping: ${pageUrl} ---`);
 
+  // Mobile user-agent for mbasic
   const context = await browser.newContext({
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    viewport: { width: 1366, height: 900 },
+    userAgent: 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
+    viewport: { width: 390, height: 844 },
     locale: 'en-US'
   });
-
-  if (fbCookies.length > 0) {
-    await context.addCookies(fbCookies);
-  }
+  if (fbCookies.length > 0) await context.addCookies(fbCookies);
 
   const page = await context.newPage();
   const lead = { pageUrl, name: '', category: '', phone: '', email: '', website: '', address: '', about: '' };
 
   try {
-    await page.goto(`${pageUrl}/about`, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    // 1. Try mbasic
+    const aboutUrl = mbasicUrl.includes('profile.php') ? mbasicUrl : `${mbasicUrl}/about`;
+    console.log('  Trying mbasic: ' + aboutUrl);
+    await page.goto(aboutUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
     await dismissOverlaysIfPresent(page);
-    await sleep(randomDelay([2500, 4500]));
+    await sleep(randomDelay([1500, 3000]));
 
-    const currentUrl = page.url();
-    if (currentUrl.includes('meta.com') || currentUrl.includes('login')) {
-      console.log('  Redirected to: ' + currentUrl + ' — skipping.');
+    let currentUrl = page.url();
+
+    // 2. If mbasic blocked, try desktop fallback
+    if (isBlocked(currentUrl)) {
+      console.log('  mbasic blocked — trying desktop fallback...');
+      const desktopAbout = pageUrl.includes('profile.php') ? pageUrl : `${pageUrl}/about`;
+      await page.goto(desktopAbout, { waitUntil: 'domcontentloaded', timeout: 45000 });
+      await sleep(randomDelay([2000, 4000]));
+      currentUrl = page.url();
+    }
+
+    // 3. Both blocked — skip
+    if (isBlocked(currentUrl)) {
+      console.log('  Both mbasic + desktop blocked — skipping.');
       await context.close();
       return lead;
     }
 
     const data = await page.evaluate(() => {
       const title = document.title.replace(/\s*\|\s*Facebook\s*$/i, '').trim();
-      const ogDescription = document.querySelector('meta[property="og:description"]')?.content || '';
+      const ogDesc = document.querySelector('meta[property="og:description"]')?.content || '';
       const bodyText = document.body ? document.body.innerText || '' : '';
       const links = [...document.querySelectorAll('a[href]')].map(a => ({ href: a.href, text: (a.innerText || '').trim() }));
-      return { title, ogDescription, bodyText, links };
+      return { title, ogDesc, bodyText, links };
     });
 
     lead.name  = data.title || '';
-    lead.about = data.ogDescription || '';
-
-    const emailRegex = /([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})/g;
-    const emailMatch = (data.bodyText.match(emailRegex) || [])
-      .find(e => !e.toLowerCase().endsWith('.png') && !e.toLowerCase().includes('sentry'));
-    lead.email = emailMatch || '';
-
-    const phoneSectionMatch = data.bodyText.match(/Phone number\s*\n?\s*([+()\d][\d\s().-]{6,}\d)/i);
-    if (phoneSectionMatch) {
-      lead.phone = phoneSectionMatch[1].trim();
-    } else {
-      const phoneRegex = /(\+?\d[\d ()\-.\u00A0]{7,}\d)/g;
-      lead.phone = (data.bodyText.match(phoneRegex) || [])[0] || '';
-    }
-
-    const addressMatch = data.bodyText.match(/Address\s*\n?\s*([^\n]{5,120})/i);
-    if (addressMatch) lead.address = addressMatch[1].trim();
-
-    const categoryMatch = data.bodyText.match(/\n(Restaurant|Local Business|Shopping & Retail|Product\/Service|Professional Service|Health\/Beauty|Home Improvement|Real Estate|Automotive|Medical & Health|Education|Contractor|Plumbing Service|Roofing Contractor)\n/i);
-    if (categoryMatch) lead.category = categoryMatch[1];
-
-    const excludedHosts = ['facebook.com', 'fb.com', 'fb.me', 'instagram.com', 'messenger.com'];
-    for (const link of data.links) {
-      const resolved = decodeFacebookRedirect(link.href);
-      try {
-        const host = new URL(resolved).hostname.replace('www.', '');
-        if (!excludedHosts.some(h => host.includes(h))) { lead.website = resolved; break; }
-      } catch (_) {}
-    }
+    lead.about = data.ogDesc || '';
+    const ex = extractLeadData(data.bodyText, data.links, pageUrl);
+    lead.email    = ex.email;
+    lead.phone    = ex.phone;
+    lead.address  = ex.address;
+    lead.website  = ex.website;
+    lead.category = ex.category;
 
     console.log(`  Name:    ${lead.name    || '—'}`);
     console.log(`  Phone:   ${lead.phone   || '—'}`);
@@ -184,11 +211,11 @@ async function scrapePage(browser, rawUrl, fbCookies = []) {
     const gotAnything = lead.email || lead.phone || lead.website || lead.address;
     if (!gotAnything) {
       console.log('  No contact fields found.');
-      if (DEBUG) console.log(`  (debug) bodyText length=${data.bodyText.length}`);
+      if (DEBUG) console.log(`  (debug) URL=${currentUrl} len=${data.bodyText.length}`);
     }
 
-  } catch (error) {
-    console.log(`  Error: ${error.message}`);
+  } catch (err) {
+    console.log(`  Error: ${err.message}`);
   }
 
   await context.close();
@@ -206,10 +233,10 @@ async function fetchPageUrlsFromSheet(sheetUrl) {
     csvUrl = sheetUrl + (sheetUrl.includes('?') ? '&' : '?') + 'output=csv';
   }
   console.log('Fetching Facebook URLs from sheet...');
-  const response = await fetch(csvUrl);
-  if (!response.ok) throw new Error('Sheet fetch failed: ' + response.status);
-  const csvText = await response.text();
-  const rows = csvText.split('\n').map(r => r.split(','));
+  const res = await fetch(csvUrl);
+  if (!res.ok) throw new Error('Sheet fetch failed: ' + res.status);
+  const csv = await res.text();
+  const rows = csv.split('\n').map(r => r.split(','));
   const urls = rows.slice(1)
     .map(r => (r[0] || '').trim().replace(/^"|"$/g, ''))
     .filter(u => u && u.startsWith('http'));
@@ -228,12 +255,10 @@ async function main() {
   console.log('Running ' + pageUrls.length + ' page(s)...\n');
   await ensureHeaderRow();
 
-  const browser = await chromium.launch({ headless: true });
-
-  // Log in once — cookies shared across all page scrapes
-  const fbCookies = await loginToFacebook(browser);
-
+  const browser    = await chromium.launch({ headless: true });
+  const fbCookies  = await loginToFacebook(browser);
   let sent = 0;
+
   try {
     for (let i = 0; i < pageUrls.length; i++) {
       const lead = await scrapePage(browser, pageUrls[i], fbCookies);
@@ -253,7 +278,7 @@ async function main() {
     await browser.close();
   }
 
-  console.log('\nDone. ' + sent + '/' + pageUrls.length + ' page(s) sent to the sheet.');
+  console.log('\nDone. ' + sent + '/' + pageUrls.length + ' page(s) sent.');
 }
 
 main().catch(err => { console.error('Fatal error:', err); process.exit(1); });
