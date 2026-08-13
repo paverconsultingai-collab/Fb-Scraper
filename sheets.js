@@ -1,7 +1,7 @@
 // sheets.js
 // Sends each scraped FB lead to the Apps Script webhook as an individual POST.
 // The webhook routes payloads with 'Facebook URL' key -> doPostLeadMultiplier.
-// Resilient: logs warnings on webhook errors but never throws.
+// Resilient: logs warnings on webhook errors but re-throws to caller.
 
 export async function ensureHeaderRow() {
   // No-op: header management is handled by the Apps Script side.
@@ -36,6 +36,7 @@ export async function appendLeads(webhookUrl, tabName, leads) {
       }
     } catch (fetchErr) {
       console.warn(`  Webhook fetch error for ${lead.pageUrl}: ${fetchErr.message.slice(0, 120)}`);
+            throw fetchErr; // re-throw — caller will not count this lead as sent
     }
   }
 }
