@@ -14,8 +14,9 @@ export async function appendLeads(webhookUrl, tabName, leads) {
     const payload = {
       'Facebook URL': lead.pageUrl || '',
       'Email':        lead.email   || '',
-      'Phone':        lead.phone   || '',
-      'Phone 2':      lead.phone2  || ''
+      'Phone':        lead.phone   || '',,
+      'Phone 2':      lead.phone2  || '',
+            'SCRAPED':   new Date().toISOString()
     };
 
     try {
