@@ -281,7 +281,7 @@ async function main() {
           const ghToken = process.env.GITHUB_TOKEN;
           const ghRepo  = process.env.GITHUB_REPOSITORY;
           if (ghToken && ghRepo) {
-                                console.log('Triggering next batch...');
+                                await sleep(90000); // 90s wait for Apps Script to clean sheet      console.log('Triggering next batch...');
                   const res = await fetch(
                             `https://api.github.com/repos/${ghRepo}/actions/workflows/scrape.yml/dispatches`,
                             { method: 'POST',
