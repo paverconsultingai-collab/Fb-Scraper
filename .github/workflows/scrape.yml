@@ -14,11 +14,15 @@ on:
         default: '0'
         type: string
 
+concurrency:
+  group: fb-scraper
+  cancel-in-progress: false
+
 jobs:
   scrape:
     runs-on: ubuntu-latest
     permissions:
-          actions: write
+      actions: write
     timeout-minutes: 60
     steps:
       - name: Check out repo
