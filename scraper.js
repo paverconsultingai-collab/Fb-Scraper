@@ -317,5 +317,6 @@ async function main() {
           } else { console.warn('GITHUB_TOKEN or GITHUB_REPOSITORY not set.'); }
 
     } else { console.log('All pages processed — no more batches.'); }
+}
 
 main().catch(err => { console.error('Fatal error:', err); process.exit(1); });
