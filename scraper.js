@@ -281,19 +281,41 @@ async function main() {
           const ghToken = process.env.GITHUB_TOKEN;
           const ghRepo  = process.env.GITHUB_REPOSITORY;
           if (ghToken && ghRepo) {
-                                await sleep(90000); // 90s wait for Apps Script to clean sheet      console.log('Triggering next batch...');
-                  const res = await fetch(
-                            `https://api.github.com/repos/${ghRepo}/actions/workflows/scrape.yml/dispatches`,
-                            { method: 'POST',
-                                       headers: { 'Authorization': `Bearer ${ghToken}`, 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json' },
-                                                              body: JSON.stringify({ ref: 'main' })
-                            }
-                          );
-                  if (res.ok || res.status === 204) {
-                            console.log(`Next batch triggered. Status: ${res.status}`);
-                          } else { const body = await res.text(); console.warn(`Trigger failed: ${res.status}`); }
-                } else { console.warn('GITHUB_TOKEN or GITHUB_REPOSITORY not set.'); }
-        } else { console.log('All pages processed — no more batches.'); }
-}
+                                              // 1. Trigger Apps Script to process + clean the Lead Multiplier sheet
+              console.log('\nTriggering processLatestMultiplierRow in Apps Script...');
+              try {
+                const cleanupRes = await fetch(SHEET_WEBHOOK_URL, {
+                  method:   'POST',
+                  headers:  { 'Content-Type': 'application/json' },
+                  body:     JSON.stringify({ action: 'processLatestMultiplierRow' }),
+                  redirect: 'follow'
+                });
+                const cleanupText = await cleanupRes.text();
+                console.log(`  Cleanup trigger: HTTP ${cleanupRes.status} — ${cleanupText.slice(0, 80)}`);
+              } catch (cleanupErr) {
+                console.warn(`  Cleanup trigger failed: ${cleanupErr.message}`);
+              }
+              // 2. Sleep 90s for Apps Script to finish cleanup before next batch reads the sheet
+              console.log('Sleeping 90s for Apps Script to finish cleanup...');
+              await sleep(90000);
+              // 3. Trigger the next batch run
+              console.log('Triggering next batch...');
+              const res = await fetch(
+                `https://api.github.com/repos/${ghRepo}/actions/workflows/scrape.yml/dispatches`,
+                {
+                  method:  'POST',
+                  headers: { 'Authorization': `Bearer ${ghToken}`, 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json' },
+                  body:    JSON.stringify({ ref: 'main' })
+                }
+              );
+              if (res.ok || res.status === 204) {
+                console.log(`Next batch triggered. Status: ${res.status}`);
+              } else {
+                const body = await res.text();
+                console.warn(`Trigger failed: ${res.status}`);
+              }
+          } else { console.warn('GITHUB_TOKEN or GITHUB_REPOSITORY not set.'); }
+
+    } else { console.log('All pages processed — no more batches.'); }
 
 main().catch(err => { console.error('Fatal error:', err); process.exit(1); });
