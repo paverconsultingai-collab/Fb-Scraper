@@ -231,18 +231,48 @@ async function fetchPageUrlsFromSheet(sheetUrl) {
   return urls;
 }
 
+// ── Pipeline monitor helper ──────────────────────────────────
+async function logToMonitor(stage, status, detail, count, total, emails) {
+  if (!SHEET_WEBHOOK_URL) return;
+  try {
+    const res = await fetch(SHEET_WEBHOOK_URL, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({
+        action: 'log', stage, status, detail,
+        count:  count  !== undefined && count  !== null ? count  : '',
+        total:  total  !== undefined && total  !== null ? total  : '',
+        emails: emails !== undefined && emails !== null ? emails : '',
+        runId:  process.env.GITHUB_RUN_ID || ''
+      }),
+      redirect: 'follow'
+    });
+    console.log(`[monitor] ${stage}: HTTP ${res.status}`);
+  } catch (e) {
+    console.log('[monitor] Log failed:', e.message);
+  }
+}
+
 async function main() {
   const SHEET_READ_URL = process.env.SHEET_READ_URL;
   if (!SHEET_READ_URL)    { console.error('SHEET_READ_URL not set.');    process.exit(1); }
   if (!SHEET_WEBHOOK_URL) { console.error('SHEET_WEBHOOK_URL not set.'); process.exit(1); }
 
   const allPageUrls = await fetchPageUrlsFromSheet(SHEET_READ_URL);
-  if (!allPageUrls.length) { console.log('No URLs found. Exiting.'); process.exit(0); }
+    if (!allPageUrls.length) {
+    await logToMonitor('FB Scraper', 'Empty Queue', 'No Facebook URLs in Lead Multiplier — check GScraper output', 0, 0, 0);
+    console.log('No URLs found. Exiting.');
+    process.exit(0);
+    }
     const BATCH_SIZE = 10;
     const startIndex = parseInt(process.env.START_INDEX || '0', 10);
     const batchUrls = allPageUrls.slice(startIndex, startIndex + BATCH_SIZE);
     const nextIndex = startIndex + BATCH_SIZE;
         const hasMore = allPageUrls.length >= BATCH_SIZE;
+    await logToMonitor('FB Scraper Start', 'Running',
+    `Batch ${Math.floor(startIndex / 10) + 1}: URLs ${startIndex + 1}–${startIndex + batchUrls.length} of ${allPageUrls.length}`,
+    startIndex + batchUrls.length, allPageUrls.length, 0
+  );
 
   const hasCookies = FB_COOKIES.length > 0;
   console.log(`Running ${batchUrls.length} page(s). Strategy: anon-first${ hasCookies ? ', cookie fallback for blocked' : ' (no cookie fallback)' }...\n`);
@@ -252,11 +282,13 @@ async function main() {
     headless: true,
     args: ['--disable-blink-features=AutomationControlled', '--no-sandbox', '--disable-setuid-sandbox']
   });
+    let emailsThisBatch = 0;
   let sent = 0;
 
   try {
     for (let i = 0; i < batchUrls.length; i++) {
       const lead = await scrapePage(browser, batchUrls[i]);
+            if (lead.email) emailsThisBatch++;
       try {
         console.log('  Sending to sheet...');
         await appendLeads(SHEET_WEBHOOK_URL, SHEET_TAB, [lead]);
@@ -276,6 +308,11 @@ async function main() {
   }
 
   console.log('\nDone. ' + sent + '/' + batchUrls.length + ' page(s) sent.');
+    const batchNum = Math.floor(startIndex / 10) + 1;
+  await logToMonitor(`FB Batch ${batchNum}`, 'Done',
+    `${batchUrls.length} pages scraped, ${emailsThisBatch} emails found`,
+    startIndex + batchUrls.length, allPageUrls.length, emailsThisBatch
+  );
     // Auto-trigger next batch if more pages remain
     if (hasMore) {
           const ghToken = process.env.GITHUB_TOKEN;
@@ -318,6 +355,10 @@ async function main() {
 
         } else {
       console.log('All pages processed — no more batches.');
+        await logToMonitor('Pipeline Complete', 'Complete',
+    'All pages processed — triggering Master Lead Cleaner',
+    startIndex + batchUrls.length, allPageUrls.length, 0
+  );
       // Final batch: fire processLatestMultiplierRow then runMasterLeadCleaner
       console.log('\nTriggering processLatestMultiplierRow in Apps Script...');
       try {
