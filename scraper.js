@@ -316,7 +316,38 @@ async function main() {
               }
           } else { console.warn('GITHUB_TOKEN or GITHUB_REPOSITORY not set.'); }
 
-    } else { console.log('All pages processed — no more batches.'); }
+        } else {
+      console.log('All pages processed — no more batches.');
+      // Final batch: fire processLatestMultiplierRow then runMasterLeadCleaner
+      console.log('\nTriggering processLatestMultiplierRow in Apps Script...');
+      try {
+        const cleanupRes = await fetch(SHEET_WEBHOOK_URL, {
+          method:   'POST',
+          headers:  { 'Content-Type': 'application/json' },
+          body:     JSON.stringify({ action: 'processLatestMultiplierRow' }),
+          redirect: 'follow'
+        });
+        const cleanupText = await cleanupRes.text();
+        console.log(`  Cleanup trigger: HTTP ${cleanupRes.status} — ${cleanupText.slice(0, 80)}`);
+      } catch (cleanupErr) {
+        console.warn(`  Cleanup trigger failed: ${cleanupErr.message}`);
+      }
+      console.log('Waiting 15s for cleanup to finish...');
+      await sleep(15000);
+      console.log('Triggering runMasterLeadCleaner...');
+      try {
+        const masterRes = await fetch(SHEET_WEBHOOK_URL, {
+          method:   'POST',
+          headers:  { 'Content-Type': 'application/json' },
+          body:     JSON.stringify({ action: 'runMasterLeadCleaner' }),
+          redirect: 'follow'
+        });
+        const masterText = await masterRes.text();
+        console.log(`  Master lead cleaner: HTTP ${masterRes.status} — ${masterText.slice(0, 80)}`);
+      } catch (masterErr) {
+        console.warn(`  Master lead cleaner failed: ${masterErr.message}`);
+      }
+    }
 }
 
 main().catch(err => { console.error('Fatal error:', err); process.exit(1); });
