@@ -32,6 +32,7 @@ export async function appendLeads(webhookUrl, tabName, leads) {
       const preview = rawText.slice(0, 120);
       if (!response.ok) {
         console.warn(`  Webhook HTTP ${response.status} for ${lead.pageUrl}: ${preview}`);
+                throw new Error('HTTP ' + response.status); // re-throw — caller will not count this lead as sent
       } else {
         console.log(`  Webhook [${lead.pageUrl}]: ${preview}`);
       }
