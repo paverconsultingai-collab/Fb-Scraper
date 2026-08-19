@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       actions: write
-    timeout-minutes: 60
+    timeout-minutes: 90  # v5: all batches in single run; raised from 60
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
@@ -35,18 +35,17 @@ jobs:
 
       - name: Install dependencies
         run: npm install
-
-      - name: Install Playwright browser
-        run: npx playwright install chromium --with-deps
+        # NOTE: Playwright browser install removed (v5 uses fetch-first, no browser needed)
+        # If you set FACEBOOK_COOKIES secret, add: npx playwright install chromium --with-deps
 
       - name: Run scraper
         env:
-          SHEET_READ_URL: ${{ secrets.SHEET_READ_URL }}
+          SHEET_READ_URL:    ${{ secrets.SHEET_READ_URL }}
           SHEET_WEBHOOK_URL: ${{ secrets.SHEET_WEBHOOK_URL }}
-          SHEET_TAB: ${{ vars.FB_SHEET_TAB }}
-          FACEBOOK_COOKIES: ${{ secrets.FACEBOOK_COOKIES }}
-          DEBUG: ${{ github.event.inputs.debug }}
-          START_INDEX: ${{ github.event.inputs.start_index || '0' }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHEET_TAB:         ${{ vars.FB_SHEET_TAB }}
+          FACEBOOK_COOKIES:  ${{ secrets.FACEBOOK_COOKIES }}
+          DEBUG:             ${{ github.event.inputs.debug }}
+          START_INDEX:       ${{ github.event.inputs.start_index || '0' }}
+          GITHUB_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: npm run scrape
