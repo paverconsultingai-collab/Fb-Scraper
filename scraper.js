@@ -1,7 +1,7 @@
-// scraper.js  v5 — fetch-first + single-run (all batches in one job) + PARALLEL=10
+// scraper.js  v5 â fetch-first + single-run (all batches in one job) + PARALLEL=10
 // PRIMARY:  raw HTTP fetch (no browser, no Playwright install needed)
 // FALLBACK: Playwright + cookies (only if FACEBOOK_COOKIES secret is set)
-// KEY WIN:  all batches loop internally — no GitHub Actions chaining overhead
+// KEY WIN:  all batches loop internally â no GitHub Actions chaining overhead
 // UNCHANGED: webhook, monitor logs, cleanup, Master Lead Cleaner subsystems
 
 import { chromium } from 'playwright';
@@ -11,7 +11,7 @@ const SHEET_WEBHOOK_URL = process.env.SHEET_WEBHOOK_URL;
 const SHEET_TAB         = process.env.SHEET_TAB || 'FB Leads';
 const FETCH_TIMEOUT_MS  = 12000;        // per-page HTTP timeout
 const AUTH_WAIT_MS      = [3000, 5000]; // Playwright fallback: React SPA wait
-const PARALLEL          = 10;           // all pages per batch at once
+const PARALLEL          = 1;            // one page at a time (sequential)
 const DEBUG = (process.env.DEBUG || '').toLowerCase() === 'true';
 
 // Load Facebook session cookies (fallback for blocked pages only)
@@ -19,7 +19,7 @@ let FB_COOKIES = [];
 try {
   const raw = (process.env.FACEBOOK_COOKIES || '').trim();
   if (!raw || raw === '[]') {
-    console.log('[auth] No FACEBOOK_COOKIES — blocked pages will be skipped.');
+    console.log('[auth] No FACEBOOK_COOKIES â blocked pages will be skipped.');
   } else if (raw.startsWith('[')) {
     const parsed = JSON.parse(raw);
     FB_COOKIES = parsed.map(c => ({
@@ -70,7 +70,7 @@ async function pmap(items, fn, concurrency) {
   return results;
 }
 
-// ── HTML parsing (replaces page.evaluate — no DOM needed) ────────────────────────────────
+// ââ HTML parsing (replaces page.evaluate â no DOM needed) ââââââââââââââââââââââââââââââââ
 function extractFromHtml(html) {
   const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
   const name = titleMatch ? titleMatch[1].replace(/\s*\|\s*Facebook\s*$/i, '').trim() : '';
@@ -106,7 +106,7 @@ function extractFromHtml(html) {
   return { name, about, email, phone, address, category, website };
 }
 
-// ── Primary path: raw HTTP fetch (no browser) ───────────────────────────────────────────────
+// ââ Primary path: raw HTTP fetch (no browser) âââââââââââââââââââââââââââââââââââââââââââââââ
 const FETCH_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
   'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
@@ -133,7 +133,7 @@ async function fetchScrape(pageUrl) {
   }
 }
 
-// ── Fallback path: Playwright + cookies (only if cookies configured) ──────────────────────
+// ââ Fallback path: Playwright + cookies (only if cookies configured) ââââââââââââââââââââââ
 async function playwrightScrape(browser, pageUrl) {
   if (!browser || FB_COOKIES.length === 0) return null;
   const ctx = await browser.newContext({
@@ -189,20 +189,20 @@ async function scrapePage(browser, rawUrl) {
       console.log('  [blocked] Retrying with Playwright + cookies...');
       const ar = await playwrightScrape(browser, pageUrl);
       data = ar || { name:'',about:'',email:'',phone:'',website:'',address:'',category:'' };
-      if (!ar) console.log('  [playwright] Still blocked — skipping.');
+      if (!ar) console.log('  [playwright] Still blocked â skipping.');
     } else {
-      console.log('  [blocked] No cookies — skipping.');
+      console.log('  [blocked] No cookies â skipping.');
       data = { name:'',about:'',email:'',phone:'',website:'',address:'',category:'' };
     }
   } else { data = fr; }
   const lead = { pageUrl, name: data.name||'', category: data.category||'',
     phone: data.phone||'', email: data.email||'', website: data.website||'',
     address: data.address||'', about: data.about||'' };
-  console.log(`  Name:    ${lead.name    || '—'}`);
-  console.log(`  Phone:   ${lead.phone   || '—'}`);
-  console.log(`  Email:   ${lead.email   || '—'}`);
-  console.log(`  Website: ${lead.website || '—'}`);
-  console.log(`  Address: ${lead.address || '—'}`);
+  console.log(`  Name:    ${lead.name    || 'â'}`);
+  console.log(`  Phone:   ${lead.phone   || 'â'}`);
+  console.log(`  Email:   ${lead.email   || 'â'}`);
+  console.log(`  Website: ${lead.website || 'â'}`);
+  console.log(`  Address: ${lead.address || 'â'}`);
   if (!lead.email && !lead.phone && !lead.website && !lead.address) console.log('  No contact fields found.');
   return lead;
 }
@@ -222,7 +222,7 @@ async function fetchPageUrlsFromSheet(sheetUrl) {
   return urls;
 }
 
-// ── Pipeline monitor ─────────────────────────────────────────────────────────────────
+// ââ Pipeline monitor âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 async function logToMonitor(stage, status, detail, count, total, emails) {
   if (!SHEET_WEBHOOK_URL) return;
   try {
@@ -246,7 +246,7 @@ async function main() {
 
   const allPageUrls = await fetchPageUrlsFromSheet(SHEET_READ_URL);
   if (!allPageUrls.length) {
-    await logToMonitor('FB Scraper','Empty Queue','No Facebook URLs in Lead Multiplier — check GScraper output',0,0,0);
+    await logToMonitor('FB Scraper','Empty Queue','No Facebook URLs in Lead Multiplier â check GScraper output',0,0,0);
     console.log('No URLs found. Exiting.'); process.exit(0);
   }
 
@@ -262,12 +262,12 @@ async function main() {
   const browser = hasCookies
     ? await chromium.launch({ headless: true, args: ['--disable-blink-features=AutomationControlled','--no-sandbox','--disable-setuid-sandbox'] })
     : null;
-  console.log(hasCookies ? '[browser] Playwright ready for blocked-page fallback.' : '[browser] No cookies — fetch-only (no Playwright launched).');
+  console.log(hasCookies ? '[browser] Playwright ready for blocked-page fallback.' : '[browser] No cookies â fetch-only (no Playwright launched).');
 
   let totalSent = 0, totalEmails = 0;
 
   try {
-    // ⭐ SINGLE-RUN LOOP: process ALL batches here, no GitHub Actions chaining
+    // â­ SINGLE-RUN LOOP: process ALL batches here, no GitHub Actions chaining
     let batchIndex = startIndex;
     let batchNum   = Math.floor(startIndex / BATCH_SIZE) + 1;
 
@@ -277,7 +277,7 @@ async function main() {
       console.log(`\n===== BATCH ${batchNum} | ${batchUrls.length} pages | last=${isLastBatch} =====`);
 
       await logToMonitor('FB Scraper Start','Running',
-        `Batch ${batchNum}: URLs ${batchIndex+1}–${batchIndex+batchUrls.length} of ${allPageUrls.length}`,
+        `Batch ${batchNum}: URLs ${batchIndex+1}â${batchIndex+batchUrls.length} of ${allPageUrls.length}`,
         batchIndex + batchUrls.length, allPageUrls.length, 0);
 
       let emailsThisBatch = 0, sentThisBatch = 0;
@@ -308,7 +308,7 @@ async function main() {
           method:'POST', headers:{'Content-Type':'application/json'},
           body: JSON.stringify({ action: 'processLatestMultiplierRow' }), redirect:'follow'
         });
-        console.log(`  Cleanup: HTTP ${cr.status} — ${(await cr.text()).slice(0,80)}`);
+        console.log(`  Cleanup: HTTP ${cr.status} â ${(await cr.text()).slice(0,80)}`);
       } catch (e) { console.warn('  Cleanup failed:', e.message); }
 
       batchIndex += BATCH_SIZE;
@@ -322,7 +322,7 @@ async function main() {
 
     console.log(`\n===== ALL DONE: ${totalSent} sent, ${totalEmails} emails =====`);
     await logToMonitor('Pipeline Complete','Complete',
-      `All ${allPageUrls.length} pages processed — triggering Master Lead Cleaner`,
+      `All ${allPageUrls.length} pages processed â triggering Master Lead Cleaner`,
       allPageUrls.length, allPageUrls.length, totalEmails);
 
     console.log('Waiting 15s before Master Lead Cleaner...');
@@ -334,7 +334,7 @@ async function main() {
         method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({ action: 'runMasterLeadCleaner' }), redirect:'follow'
       });
-      console.log(`  Master Lead Cleaner: HTTP ${mr.status} — ${(await mr.text()).slice(0,80)}`);
+      console.log(`  Master Lead Cleaner: HTTP ${mr.status} â ${(await mr.text()).slice(0,80)}`);
     } catch (me) { console.warn('  Master Lead Cleaner failed:', me.message); }
 
   } finally {
