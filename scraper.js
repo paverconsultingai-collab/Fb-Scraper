@@ -1,4 +1,4 @@
-// scraper.js  v3 — Hybrid: anonymous-first, cookie fallback for blocked pages
+// scraper.js  v4 — Parallel batch (concurrency 3) + faster timings; logic unchanged
 // Why: anonymous mode gets Facebook's static preview (has contact info).
 // Authenticated mode triggers the React SPA (dynamic, harder to extract).
 // Strategy: scrape anonymously first. If redirected to login, retry with cookies.
@@ -8,9 +8,10 @@ import { ensureHeaderRow, appendLeads } from './sheets.js';
 
 const SHEET_WEBHOOK_URL     = process.env.SHEET_WEBHOOK_URL;
 const SHEET_TAB             = process.env.SHEET_TAB || 'FB Leads';
-const BETWEEN_PAGE_DELAY_MS = [4000, 9000];
-const ANON_WAIT_MS          = [2500, 4500];   // anon: static HTML, renders fast
-const AUTH_WAIT_MS          = [7000, 11000];  // auth: React SPA, needs longer
+const BETWEEN_PAGE_DELAY_MS = [1500, 3000];  // reduced: was [4000, 9000]
+const ANON_WAIT_MS          = [1500, 2500];   // reduced: was [2500, 4500] — static HTML renders fast
+const AUTH_WAIT_MS          = [4000, 7000];   // reduced: was [7000, 11000] — React SPA needs longer
+const PARALLEL              = 3;               // concurrent pages per batch (biggest speed win)
 const DEBUG = (process.env.DEBUG || '').toLowerCase() === 'true';
 
 // Load Facebook session cookies (used as fallback for blocked pages only)
@@ -68,6 +69,20 @@ function isBlocked(url) {
          url.includes('checkpoint') || url.includes('two_step_verification');
 }
 
+// Parallel map with concurrency limit — runs up to `concurrency` items simultaneously
+async function pmap(items, fn, concurrency) {
+  const results = new Array(items.length);
+  let index = 0;
+  async function worker() {
+    while (index < items.length) {
+      const i = index++;
+      results[i] = await fn(items[i], i);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
+  return results;
+}
+
 async function dismissOverlays(page) {
   for (const sel of [
     'button:has-text("Decline optional cookies")',
@@ -77,7 +92,7 @@ async function dismissOverlays(page) {
   ]) {
     try {
       const btn = page.locator(sel).first();
-      if (await btn.isVisible({ timeout: 1500 })) { await btn.click(); await sleep(600); }
+      if (await btn.isVisible({ timeout: 300 })) { await btn.click(); await sleep(400); }
     } catch (_) {}
   }
 }
@@ -275,7 +290,7 @@ async function main() {
   );
 
   const hasCookies = FB_COOKIES.length > 0;
-  console.log(`Running ${batchUrls.length} page(s). Strategy: anon-first${ hasCookies ? ', cookie fallback for blocked' : ' (no cookie fallback)' }...\n`);
+  console.log(`Running ${batchUrls.length} page(s) with concurrency ${PARALLEL}. Strategy: anon-first${ hasCookies ? ', cookie fallback for blocked' : ' (no cookie fallback)' }...\n`);
   await ensureHeaderRow();
 
   const browser = await chromium.launch({
@@ -286,23 +301,19 @@ async function main() {
   let sent = 0;
 
   try {
-    for (let i = 0; i < batchUrls.length; i++) {
-      const lead = await scrapePage(browser, batchUrls[i]);
-            if (lead.email) emailsThisBatch++;
+    // Scrape up to PARALLEL pages simultaneously; send each to sheet as it completes
+    await pmap(batchUrls, async (url, i) => {
+      const lead = await scrapePage(browser, url);
+      if (lead.email) emailsThisBatch++;
       try {
-        console.log('  Sending to sheet...');
+        console.log(`  [${i + 1}/${batchUrls.length}] Sending to sheet...`);
         await appendLeads(SHEET_WEBHOOK_URL, SHEET_TAB, [lead]);
         sent++;
-        console.log(`  Sent to sheet OK (${sent}/${batchUrls.length})`);
+        console.log(`  [${i + 1}/${batchUrls.length}] Sent OK (${sent} sent so far)`);
       } catch (webhookErr) {
         console.warn(`  Webhook error (continuing): ${webhookErr.message.slice(0, 120)}`);
       }
-      if (i < batchUrls.length - 1) {
-        const delay = randomDelay(BETWEEN_PAGE_DELAY_MS);
-        console.log(' Waiting ' + Math.round(delay / 1000) + 's before next page...');
-        await sleep(delay);
-      }
-    }
+    }, PARALLEL);
   } finally {
     await browser.close();
   }
