@@ -1,4 +1,4 @@
-// scraper.js  v5 — fetch-first + single-run (all batches in one job) + PARALLEL=10
+// scraper.js  v6 — improved extraction + JSON parsing + better block detection
 // PRIMARY:  raw HTTP fetch (no browser, no Playwright install needed)
 // FALLBACK: Playwright + cookies (only if FACEBOOK_COOKIES secret is set)
 // KEY WIN:  all batches loop internally — no GitHub Actions chaining overhead
@@ -103,6 +103,19 @@ function extractFromHtml(html) {
       if (!excluded.some(h => host.includes(h))) { website = resolved; break; }
     } catch (_) {}
   }
+  // v6: JSON/script fallback (Facebook embeds structured data in script tags)
+  if (!email) {
+    const eM = html.match(/"email":"([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})"/i);
+    if (eM && !eM[1].includes('facebook') && !eM[1].includes('sentry') && !eM[1].includes('@example')) email = eM[1];
+  }
+  if (!phone) {
+    const pM = html.match(/"phone":"([^"]{6,25})"/) || html.match(/"phone_number":"([^"]{6,25})"/);
+    if (pM) phone = pM[1].replace(/\\u([0-9a-f]{4})/gi, (_, h) => String.fromCharCode(parseInt(h, 16)));
+  }
+  if (!website) {
+    const wM = html.match(/"website":"(https?:[^\\"]+)"/) || html.match(/"website_url":"(https?:[^\\"]+)"/);
+    if (wM) website = wM[1].replace(/\\u002F/g, '/').replace(/\\//g, '/');
+  }
   return { name, about, email, phone, address, category, website };
 }
 
@@ -125,7 +138,7 @@ async function fetchScrape(pageUrl) {
     if (!res.ok) { console.log(`  [fetch] HTTP ${res.status}`); return { blocked: true }; }
     const html = await res.text();
     console.log(`  [fetch] ${html.length} chars`);
-    if (html.includes('login_form')) return { blocked: true };
+    if (html.includes('login_form') || html.includes('"loginRequired":true') || html.includes('id="loginbutton"') || html.length < 10000 || (html.includes('Log In or Sign Up') && html.length < 80000)) return { blocked: true };
     return { blocked: false, ...extractFromHtml(html) };
   } catch (e) {
     console.log(`  [fetch] Error: ${e.message.slice(0,80)}`);
