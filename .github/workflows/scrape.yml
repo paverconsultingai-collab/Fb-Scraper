@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       actions: write
-    timeout-minutes: 90  # v5: all batches in single run; raised from 60
+    timeout-minutes: 90
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
@@ -35,8 +35,17 @@ jobs:
 
       - name: Install dependencies
         run: npm install
-        # NOTE: Playwright browser install removed (v5 uses fetch-first, no browser needed)
-        # If you set FACEBOOK_COOKIES secret, add: npx playwright install chromium --with-deps
+
+      - name: Install Playwright browser (only when FACEBOOK_COOKIES secret is set)
+        env:
+          HAS_COOKIES: ${{ secrets.FACEBOOK_COOKIES }}
+        run: |
+          if [ -n "$HAS_COOKIES" ]; then
+            echo 'FACEBOOK_COOKIES detected — installing Chromium for cookie fallback...'
+            npx playwright install chromium --with-deps
+          else
+            echo 'No FACEBOOK_COOKIES — skipping Playwright install (fetch-only mode)'
+          fi
 
       - name: Run scraper
         env:
