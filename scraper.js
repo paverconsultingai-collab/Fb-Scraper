@@ -1,48 +1,54 @@
-// scraper.js  v5 â fetch-first + single-run (all batches in one job) + PARALLEL=10
-// PRIMARY:  raw HTTP fetch (no browser, no Playwright install needed)
-// FALLBACK: Playwright + cookies (only if FACEBOOK_COOKIES secret is set)
-// KEY WIN:  all batches loop internally â no GitHub Actions chaining overhead
-// UNCHANGED: webhook, monitor logs, cleanup, Master Lead Cleaner subsystems
+// scraper.js  v3 — Hybrid: anonymous-first, cookie fallback for blocked pages
+// Why: anonymous mode gets Facebook's static preview (has contact info).
+// Authenticated mode triggers the React SPA (dynamic, harder to extract).
+// Strategy: scrape anonymously first. If redirected to login, retry with cookies.
 
 import { chromium } from 'playwright';
 import { ensureHeaderRow, appendLeads } from './sheets.js';
 
-const SHEET_WEBHOOK_URL = process.env.SHEET_WEBHOOK_URL;
-const SHEET_TAB         = process.env.SHEET_TAB || 'FB Leads';
-const FETCH_TIMEOUT_MS  = 12000;        // per-page HTTP timeout
-const AUTH_WAIT_MS      = [3000, 5000]; // Playwright fallback: React SPA wait
-const PARALLEL          = 1;            // one page at a time (sequential)
+const SHEET_WEBHOOK_URL     = process.env.SHEET_WEBHOOK_URL;
+const SHEET_TAB             = process.env.SHEET_TAB || 'FB Leads';
+const BETWEEN_PAGE_DELAY_MS = [4000, 9000];
+const ANON_WAIT_MS          = [2500, 4500];   // anon: static HTML, renders fast
+const AUTH_WAIT_MS          = [7000, 11000];  // auth: React SPA, needs longer
 const DEBUG = (process.env.DEBUG || '').toLowerCase() === 'true';
 
-// Load Facebook session cookies (fallback for blocked pages only)
+// Load Facebook session cookies (used as fallback for blocked pages only)
 let FB_COOKIES = [];
 try {
   const raw = (process.env.FACEBOOK_COOKIES || '').trim();
   if (!raw || raw === '[]') {
-    console.log('[auth] No FACEBOOK_COOKIES â blocked pages will be skipped.');
+    console.log('[auth] No FACEBOOK_COOKIES — blocked pages will be skipped.');
   } else if (raw.startsWith('[')) {
     const parsed = JSON.parse(raw);
     FB_COOKIES = parsed.map(c => ({
-      name:     c.name, value: c.value,
+      name:     c.name,
+      value:    c.value,
       domain:   c.domain ? (c.domain.startsWith('.') ? c.domain : '.' + c.domain) : '.facebook.com',
-      path:     c.path || '/', httpOnly: !!c.httpOnly, secure: !!c.secure,
-      sameSite: c.sameSite || 'None', expires: c.expires ?? c.expirationDate ?? -1
+      path:     c.path || '/',
+      httpOnly: !!c.httpOnly,
+      secure:   !!c.secure,
+      sameSite: c.sameSite || 'None',
+      expires:  c.expires ?? c.expirationDate ?? -1
     }));
-    console.log(`[auth] Loaded ${FB_COOKIES.length} cookies (JSON).`);
+    console.log(`[auth] Loaded ${FB_COOKIES.length} cookies (JSON) — cookie fallback ready.`);
   } else {
     FB_COOKIES = raw.split(';').map(pair => {
       const eqIdx = pair.indexOf('=');
       if (eqIdx === -1) return null;
-      const name = pair.slice(0, eqIdx).trim(), value = pair.slice(eqIdx + 1).trim();
+      const name  = pair.slice(0, eqIdx).trim();
+      const value = pair.slice(eqIdx + 1).trim();
       if (!name) return null;
       return { name, value, domain: '.facebook.com', path: '/', secure: true, sameSite: 'None' };
     }).filter(Boolean);
-    console.log(`[auth] Loaded ${FB_COOKIES.length} cookies (raw).`);
+    console.log(`[auth] Loaded ${FB_COOKIES.length} cookies (raw) — cookie fallback ready.`);
   }
-} catch (e) { console.warn('[auth] Could not parse FACEBOOK_COOKIES:', e.message); }
+} catch (e) {
+  console.warn('[auth] Could not parse FACEBOOK_COOKIES:', e.message);
+}
 
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 function randomDelay([min, max]) { return min + Math.floor(Math.random() * (max - min)); }
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 function normalizePageUrl(rawUrl) {
   let url = rawUrl.trim();
   if (!url.startsWith('http')) url = `https://${url}`;
@@ -51,9 +57,9 @@ function normalizePageUrl(rawUrl) {
 }
 function decodeFacebookRedirect(href) {
   try {
-    const p = new URL(href);
-    if (p.hostname.includes('l.facebook.com') && p.searchParams.has('u'))
-      return decodeURIComponent(p.searchParams.get('u'));
+    const parsed = new URL(href);
+    if (parsed.hostname.includes('l.facebook.com') && parsed.searchParams.has('u'))
+      return decodeURIComponent(parsed.searchParams.get('u'));
     return href;
   } catch (_) { return href; }
 }
@@ -62,181 +68,189 @@ function isBlocked(url) {
          url.includes('checkpoint') || url.includes('two_step_verification');
 }
 
-// Parallel map with concurrency limit
-async function pmap(items, fn, concurrency) {
-  const results = new Array(items.length); let index = 0;
-  async function worker() { while (index < items.length) { const i = index++; results[i] = await fn(items[i], i); } }
-  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
-  return results;
-}
-
-// ââ HTML parsing (replaces page.evaluate â no DOM needed) ââââââââââââââââââââââââââââââââ
-function extractFromHtml(html) {
-  const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
-  const name = titleMatch ? titleMatch[1].replace(/\s*\|\s*Facebook\s*$/i, '').trim() : '';
-  const ogMatch = html.match(/<meta\s[^>]*property=["']og:description["'][^>]*content=["']([^"']+)["']/i)
-               || html.match(/<meta\s[^>]*content=["']([^"']+)["'][^>]*property=["']og:description["']/i);
-  const about = ogMatch ? ogMatch[1].replace(/&#039;/g, "'").replace(/&amp;/g, '&') : '';
-  const bodyText = html
-    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
-    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&#039;/g, "'")
-    .replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim();
-  const emailRegex = /([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})/g;
-  const email = (bodyText.match(emailRegex) || [])
-    .find(e => !e.toLowerCase().endsWith('.png') && !e.includes('sentry') && !e.includes('facebook')) || '';
-  const phoneSectionMatch = bodyText.match(/Phone number\s*\n?\s*([+()\d][\d\s().-]{6,}\d)/i);
-  const phone = phoneSectionMatch ? phoneSectionMatch[1].trim()
-    : (bodyText.match(/(\+?\d[\d ()\-.\u00A0]{7,}\d)/g) || [])[0] || '';
-  const addrMatch = bodyText.match(/Address\s*\n?\s*([^\n]{5,120})/i);
-  const address = addrMatch ? addrMatch[1].trim() : '';
-  const catMatch = bodyText.match(/\n(Restaurant|Local Business|Shopping & Retail|Product\/Service|Professional Service|Health\/Beauty|Home Improvement|Real Estate|Automotive|Medical & Health|Education|Contractor|Plumbing Service|Roofing Contractor)\n/i);
-  const category = catMatch ? catMatch[1] : '';
-  const excluded = ['facebook.com','fb.com','fb.me','instagram.com','messenger.com'];
-  let website = ''; const hrefRe = /href=["']([^"']+)["']/gi; let m;
-  while ((m = hrefRe.exec(html)) !== null) {
-    const raw = m[1]; if (!raw.startsWith('http')) continue;
-    const resolved = decodeFacebookRedirect(raw);
-    try { const host = new URL(resolved).hostname.replace('www.','');
-      if (!excluded.some(h => host.includes(h))) { website = resolved; break; }
+async function dismissOverlays(page) {
+  for (const sel of [
+    'button:has-text("Decline optional cookies")',
+    'button:has-text("Allow all cookies")',
+    '[aria-label="Close"]',
+    'button:has-text("Not Now")'
+  ]) {
+    try {
+      const btn = page.locator(sel).first();
+      if (await btn.isVisible({ timeout: 1500 })) { await btn.click(); await sleep(600); }
     } catch (_) {}
   }
-  return { name, about, email, phone, address, category, website };
 }
 
-// ââ Primary path: raw HTTP fetch (no browser) âââââââââââââââââââââââââââââââââââââââââââââââ
-const FETCH_HEADERS = {
-  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-  'Accept-Language': 'en-US,en;q=0.9', 'Cache-Control': 'no-cache',
-  'Sec-Fetch-Mode': 'navigate', 'Sec-Fetch-Site': 'none', 'Sec-Fetch-User': '?1',
-};
-
-async function fetchScrape(pageUrl) {
-  const aboutUrl = pageUrl.includes('profile.php') ? pageUrl : `${pageUrl}/about`;
-  try {
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
-    const res = await fetch(aboutUrl, { headers: FETCH_HEADERS, redirect: 'follow', signal: ctrl.signal });
-    clearTimeout(t);
-    if (isBlocked(res.url || aboutUrl)) return { blocked: true };
-    if (!res.ok) { console.log(`  [fetch] HTTP ${res.status}`); return { blocked: true }; }
-    const html = await res.text();
-    console.log(`  [fetch] ${html.length} chars`);
-    if (html.includes('login_form')) return { blocked: true };
-    return { blocked: false, ...extractFromHtml(html) };
-  } catch (e) {
-    console.log(`  [fetch] Error: ${e.message.slice(0,80)}`);
-    return { blocked: false, name:'', about:'', email:'', phone:'', website:'', address:'', category:'' };
-  }
-}
-
-// ââ Fallback path: Playwright + cookies (only if cookies configured) ââââââââââââââââââââââ
-async function playwrightScrape(browser, pageUrl) {
-  if (!browser || FB_COOKIES.length === 0) return null;
-  const ctx = await browser.newContext({
+// Core scrape: one attempt with a given context (anon or authenticated)
+async function scrapeWithContext(browser, pageUrl, useCookies) {
+  const context = await browser.newContext({
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    viewport: { width: 1440, height: 900 }, locale: 'en-US',
+    viewport:  { width: 1440, height: 900 },
+    locale:    'en-US',
     extraHTTPHeaders: { 'Accept-Language': 'en-US,en;q=0.9' }
   });
-  await ctx.addInitScript(() => {
+
+  await context.addInitScript(() => {
     Object.defineProperty(navigator, 'webdriver', { get: () => false });
-    Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] });
-    Object.defineProperty(navigator, 'plugins',   { get: () => [1,2,3,4,5] });
+    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+    Object.defineProperty(navigator, 'plugins',   { get: () => [1, 2, 3, 4, 5] });
     window.chrome = { runtime: {} };
   });
-  await ctx.addCookies(FB_COOKIES);
-  const page = await ctx.newPage();
+
+  if (useCookies && FB_COOKIES.length > 0) {
+    await context.addCookies(FB_COOKIES);
+  }
+
+  const page = await context.newPage();
+  const result = { blocked: false, name: '', phone: '', email: '', website: '', address: '', about: '', category: '' };
+
   try {
     const aboutUrl = pageUrl.includes('profile.php') ? pageUrl : `${pageUrl}/about`;
-    await page.goto(aboutUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await sleep(randomDelay(AUTH_WAIT_MS));
-    if (isBlocked(page.url())) { await ctx.close(); return null; }
-    const d = await page.evaluate(() => ({
+    await page.goto(aboutUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await dismissOverlays(page);
+
+    // Anon: static HTML ready fast. Auth: React SPA needs more time.
+    await sleep(randomDelay(useCookies ? AUTH_WAIT_MS : ANON_WAIT_MS));
+
+    const currentUrl = page.url();
+    if (isBlocked(currentUrl)) {
+      result.blocked = true;
+      await context.close();
+      return result;
+    }
+
+    const data = await page.evaluate(() => ({
       title:    document.title.replace(/\s*\|\s*Facebook\s*$/i, '').trim(),
       ogDesc:   document.querySelector('meta[property="og:description"]')?.content || '',
       bodyText: document.body?.innerText || '',
       bodyLen:  (document.body?.innerText || '').length,
       links:    [...document.querySelectorAll('a[href]')].map(a => ({ href: a.href, text: (a.innerText||'').trim() }))
     }));
-    console.log(`  [playwright-auth] ${d.bodyLen} chars`);
-    const eRe = /([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})/g;
-    const email = (d.bodyText.match(eRe) || []).find(e => !e.endsWith('.png') && !e.includes('sentry') && !e.includes('facebook')) || '';
-    const phM = d.bodyText.match(/Phone number\s*\n?\s*([+()\d][\d\s().-]{6,}\d)/i);
-    const phone = phM ? phM[1].trim() : (d.bodyText.match(/(\+?\d[\d ()\-.\u00A0]{7,}\d)/g) || [])[0] || '';
-    const adM = d.bodyText.match(/Address\s*\n?\s*([^\n]{5,120})/i);
-    const address = adM ? adM[1].trim() : '';
-    const cM = d.bodyText.match(/\n(Restaurant|Local Business|Shopping & Retail|Product\/Service|Professional Service|Health\/Beauty|Home Improvement|Real Estate|Automotive|Medical & Health|Education|Contractor|Plumbing Service|Roofing Contractor)\n/i);
-    const category = cM ? cM[1] : '';
-    const excl = ['facebook.com','fb.com','fb.me','instagram.com','messenger.com'];
-    let website = '';
-    for (const lk of d.links) { const r = decodeFacebookRedirect(lk.href);
-      try { const h = new URL(r).hostname.replace('www.',''); if (!excl.some(x => h.includes(x))) { website = r; break; } } catch(_){} }
-    await ctx.close();
-    return { name: d.title, about: d.ogDesc, email, phone, address, category, website };
-  } catch (err) { console.log(`  [playwright-auth] Error: ${err.message.slice(0,80)}`); await ctx.close(); return null; }
+
+    console.log(`  [body] ${data.bodyLen} chars` + (useCookies ? ' (auth)' : ' (anon)'));
+
+    result.name  = data.title  || '';
+    result.about = data.ogDesc || '';
+
+    const emailRegex = /([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})/g;
+    result.email = (data.bodyText.match(emailRegex) || [])
+      .find(e => !e.toLowerCase().endsWith('.png') && !e.includes('sentry') && !e.includes('facebook')) || '';
+
+    const phoneSectionMatch = data.bodyText.match(/Phone number\s*\n?\s*([+()\d][\d\s().-]{6,}\d)/i);
+    if (phoneSectionMatch) {
+      result.phone = phoneSectionMatch[1].trim();
+    } else {
+      result.phone = (data.bodyText.match(/(\+?\d[\d ()\-.\u00A0]{7,}\d)/g) || [])[0] || '';
+    }
+
+    const addrMatch = data.bodyText.match(/Address\s*\n?\s*([^\n]{5,120})/i);
+    if (addrMatch) result.address = addrMatch[1].trim();
+
+    const catMatch = data.bodyText.match(/\n(Restaurant|Local Business|Shopping & Retail|Product\/Service|Professional Service|Health\/Beauty|Home Improvement|Real Estate|Automotive|Medical & Health|Education|Contractor|Plumbing Service|Roofing Contractor)\n/i);
+    if (catMatch) result.category = catMatch[1];
+
+    const excluded = ['facebook.com','fb.com','fb.me','instagram.com','messenger.com'];
+    for (const link of data.links) {
+      const resolved = decodeFacebookRedirect(link.href);
+      try {
+        const host = new URL(resolved).hostname.replace('www.','');
+        if (!excluded.some(h => host.includes(h))) { result.website = resolved; break; }
+      } catch (_) {}
+    }
+
+  } catch (err) {
+    console.log(`  Error: ${err.message.slice(0,120)}`);
+  }
+
+  await context.close();
+  return result;
 }
 
 async function scrapePage(browser, rawUrl) {
   const pageUrl = normalizePageUrl(rawUrl);
   console.log(`\n--- Scraping: ${pageUrl} ---`);
-  const fr = await fetchScrape(pageUrl);
-  let data;
-  if (fr.blocked) {
-    if (FB_COOKIES.length > 0 && browser) {
-      console.log('  [blocked] Retrying with Playwright + cookies...');
-      const ar = await playwrightScrape(browser, pageUrl);
-      data = ar || { name:'',about:'',email:'',phone:'',website:'',address:'',category:'' };
-      if (!ar) console.log('  [playwright] Still blocked â skipping.');
+
+  // Pass 1: anonymous — gets static HTML with contact info
+  let result = await scrapeWithContext(browser, pageUrl, false);
+
+  // Pass 2: if blocked AND we have cookies, retry authenticated
+  if (result.blocked) {
+    if (FB_COOKIES.length > 0) {
+      console.log('  [blocked anon] Retrying with session cookies...');
+      result = await scrapeWithContext(browser, pageUrl, true);
+      if (result.blocked) {
+        console.log('  [blocked auth] Still blocked — skipping.');
+      }
     } else {
-      console.log('  [blocked] No cookies â skipping.');
-      data = { name:'',about:'',email:'',phone:'',website:'',address:'',category:'' };
+      console.log('  [blocked] No cookies available — skipping.');
     }
-  } else { data = fr; }
-  const lead = { pageUrl, name: data.name||'', category: data.category||'',
-    phone: data.phone||'', email: data.email||'', website: data.website||'',
-    address: data.address||'', about: data.about||'' };
-  console.log(`  Name:    ${lead.name    || 'â'}`);
-  console.log(`  Phone:   ${lead.phone   || 'â'}`);
-  console.log(`  Email:   ${lead.email   || 'â'}`);
-  console.log(`  Website: ${lead.website || 'â'}`);
-  console.log(`  Address: ${lead.address || 'â'}`);
-  if (!lead.email && !lead.phone && !lead.website && !lead.address) console.log('  No contact fields found.');
+  }
+
+  const lead = {
+    pageUrl,
+    name:     result.name,
+    category: result.category,
+    phone:    result.phone,
+    email:    result.email,
+    website:  result.website,
+    address:  result.address,
+    about:    result.about
+  };
+
+  console.log(`  Name:    ${lead.name    || '—'}`);
+  console.log(`  Phone:   ${lead.phone   || '—'}`);
+  console.log(`  Email:   ${lead.email   || '—'}`);
+  console.log(`  Website: ${lead.website || '—'}`);
+  console.log(`  Address: ${lead.address || '—'}`);
+  if (!lead.email && !lead.phone && !lead.website && !lead.address)
+    console.log('  No contact fields found.');
+
   return lead;
 }
 
 async function fetchPageUrlsFromSheet(sheetUrl) {
   let csvUrl = sheetUrl;
-  if (sheetUrl.includes('/pubhtml')) { csvUrl = sheetUrl.replace('/pubhtml','/pub'); if (!csvUrl.includes('output=csv')) csvUrl += '&output=csv'; }
-  else if (sheetUrl.includes('/edit')) { csvUrl = sheetUrl.replace(/\/edit.*$/, '/export?format=csv'); }
-  else if (!sheetUrl.includes('output=csv') && !sheetUrl.includes('format=csv')) { csvUrl = sheetUrl + (sheetUrl.includes('?') ? '&' : '?') + 'output=csv'; }
+  if (sheetUrl.includes('/pubhtml')) {
+    csvUrl = sheetUrl.replace('/pubhtml', '/pub');
+    if (!csvUrl.includes('output=csv')) csvUrl += '&output=csv';
+  } else if (sheetUrl.includes('/edit')) {
+    csvUrl = sheetUrl.replace(/\/edit.*$/, '/export?format=csv');
+  } else if (!sheetUrl.includes('output=csv') && !sheetUrl.includes('format=csv')) {
+    csvUrl = sheetUrl + (sheetUrl.includes('?') ? '&' : '?') + 'output=csv';
+  }
   console.log('Fetching Facebook URLs from sheet...');
   const res = await fetch(csvUrl);
   if (!res.ok) throw new Error('Sheet fetch failed: ' + res.status);
   const csv = await res.text();
   const rows = csv.split('\n').map(r => r.split(','));
-  const urls = rows.slice(1).map(r => (r[0]||'').trim().replace(/^"|"$/g,'')).filter(u => u && u.startsWith('http'));
+  const urls = rows.slice(1)
+    .map(r => (r[0] || '').trim().replace(/^"|"$/g, ''))
+    .filter(u => u && u.startsWith('http'));
   console.log('Found ' + urls.length + ' Facebook URLs in sheet.');
   return urls;
 }
 
-// ââ Pipeline monitor âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+// ── Pipeline monitor helper ──────────────────────────────────
 async function logToMonitor(stage, status, detail, count, total, emails) {
   if (!SHEET_WEBHOOK_URL) return;
   try {
     const res = await fetch(SHEET_WEBHOOK_URL, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'log', stage, status, detail,
-        count:  count  != null ? count  : '',
-        total:  total  != null ? total  : '',
-        emails: emails != null ? emails : '',
-        runId:  process.env.GITHUB_RUN_ID || '' }),
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({
+        action: 'log', stage, status, detail,
+        count:  count  !== undefined && count  !== null ? count  : '',
+        total:  total  !== undefined && total  !== null ? total  : '',
+        emails: emails !== undefined && emails !== null ? emails : '',
+        runId:  process.env.GITHUB_RUN_ID || ''
+      }),
       redirect: 'follow'
     });
     console.log(`[monitor] ${stage}: HTTP ${res.status}`);
-  } catch (e) { console.log('[monitor] Log failed:', e.message); }
+  } catch (e) {
+    console.log('[monitor] Log failed:', e.message);
+  }
 }
 
 async function main() {
@@ -245,101 +259,136 @@ async function main() {
   if (!SHEET_WEBHOOK_URL) { console.error('SHEET_WEBHOOK_URL not set.'); process.exit(1); }
 
   const allPageUrls = await fetchPageUrlsFromSheet(SHEET_READ_URL);
-  if (!allPageUrls.length) {
-    await logToMonitor('FB Scraper','Empty Queue','No Facebook URLs in Lead Multiplier â check GScraper output',0,0,0);
-    console.log('No URLs found. Exiting.'); process.exit(0);
-  }
-
-  const BATCH_SIZE = 10;
-  const startIndex = parseInt(process.env.START_INDEX || '0', 10);
-  const totalBatches = Math.ceil((allPageUrls.length - startIndex) / BATCH_SIZE);
-  console.log(`Total URLs: ${allPageUrls.length} | Start: ${startIndex} | Batches this run: ${totalBatches}`);
+    if (!allPageUrls.length) {
+    await logToMonitor('FB Scraper', 'Empty Queue', 'No Facebook URLs in Lead Multiplier — check GScraper output', 0, 0, 0);
+    console.log('No URLs found. Exiting.');
+    process.exit(0);
+    }
+    const BATCH_SIZE = 10;
+    const startIndex = parseInt(process.env.START_INDEX || '0', 10);
+    const batchUrls = allPageUrls.slice(startIndex, startIndex + BATCH_SIZE);
+    const nextIndex = startIndex + BATCH_SIZE;
+        const hasMore = allPageUrls.length >= BATCH_SIZE;
+    await logToMonitor('FB Scraper Start', 'Running',
+    `Batch ${Math.floor(startIndex / 10) + 1}: URLs ${startIndex + 1}–${startIndex + batchUrls.length} of ${allPageUrls.length}`,
+    startIndex + batchUrls.length, allPageUrls.length, 0
+  );
 
   const hasCookies = FB_COOKIES.length > 0;
+  console.log(`Running ${batchUrls.length} page(s). Strategy: anon-first${ hasCookies ? ', cookie fallback for blocked' : ' (no cookie fallback)' }...\n`);
   await ensureHeaderRow();
 
-  // Only launch Playwright if cookies are set (rare fallback path)
-  const browser = hasCookies
-    ? await chromium.launch({ headless: true, args: ['--disable-blink-features=AutomationControlled','--no-sandbox','--disable-setuid-sandbox'] })
-    : null;
-  console.log(hasCookies ? '[browser] Playwright ready for blocked-page fallback.' : '[browser] No cookies â fetch-only (no Playwright launched).');
-
-  let totalSent = 0, totalEmails = 0;
+  const browser = await chromium.launch({
+    headless: true,
+    args: ['--disable-blink-features=AutomationControlled', '--no-sandbox', '--disable-setuid-sandbox']
+  });
+    let emailsThisBatch = 0;
+  let sent = 0;
 
   try {
-    // â­ SINGLE-RUN LOOP: process ALL batches here, no GitHub Actions chaining
-    let batchIndex = startIndex;
-    let batchNum   = Math.floor(startIndex / BATCH_SIZE) + 1;
-
-    while (batchIndex < allPageUrls.length) {
-      const batchUrls   = allPageUrls.slice(batchIndex, batchIndex + BATCH_SIZE);
-      const isLastBatch = batchIndex + BATCH_SIZE >= allPageUrls.length;
-      console.log(`\n===== BATCH ${batchNum} | ${batchUrls.length} pages | last=${isLastBatch} =====`);
-
-      await logToMonitor('FB Scraper Start','Running',
-        `Batch ${batchNum}: URLs ${batchIndex+1}â${batchIndex+batchUrls.length} of ${allPageUrls.length}`,
-        batchIndex + batchUrls.length, allPageUrls.length, 0);
-
-      let emailsThisBatch = 0, sentThisBatch = 0;
-
-      // All pages in batch run simultaneously via fetch
-      await pmap(batchUrls, async (url, i) => {
-        const lead = await scrapePage(browser, url);
-        if (lead.email) emailsThisBatch++;
-        try {
-          console.log(`  [${batchNum}.${i+1}/${batchUrls.length}] Sending to sheet...`);
-          await appendLeads(SHEET_WEBHOOK_URL, SHEET_TAB, [lead]);
-          sentThisBatch++;
-          console.log(`  [${batchNum}.${i+1}] Sent OK`);
-        } catch (we) { console.warn(`  Webhook error: ${we.message.slice(0,100)}`); }
-      }, PARALLEL);
-
-      totalSent   += sentThisBatch;
-      totalEmails += emailsThisBatch;
-
-      await logToMonitor(`FB Batch ${batchNum}`,'Done',
-        `${batchUrls.length} pages scraped, ${emailsThisBatch} emails found`,
-        batchIndex + batchUrls.length, allPageUrls.length, emailsThisBatch);
-
-      // Trigger cleanup webhook (marks rows as SCRAPED in Lead Multiplier)
-      console.log('\nTriggering processLatestMultiplierRow...');
+    for (let i = 0; i < batchUrls.length; i++) {
+      const lead = await scrapePage(browser, batchUrls[i]);
+            if (lead.email) emailsThisBatch++;
       try {
-        const cr = await fetch(SHEET_WEBHOOK_URL, {
-          method:'POST', headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({ action: 'processLatestMultiplierRow' }), redirect:'follow'
-        });
-        console.log(`  Cleanup: HTTP ${cr.status} â ${(await cr.text()).slice(0,80)}`);
-      } catch (e) { console.warn('  Cleanup failed:', e.message); }
-
-      batchIndex += BATCH_SIZE;
-      batchNum++;
-
-      if (!isLastBatch) {
-        console.log('Sleeping 45s (Apps Script cleanup + sheet flush)...');
-        await sleep(45000);
+        console.log('  Sending to sheet...');
+        await appendLeads(SHEET_WEBHOOK_URL, SHEET_TAB, [lead]);
+        sent++;
+        console.log(`  Sent to sheet OK (${sent}/${batchUrls.length})`);
+      } catch (webhookErr) {
+        console.warn(`  Webhook error (continuing): ${webhookErr.message.slice(0, 120)}`);
       }
-    }  // end while
-
-    console.log(`\n===== ALL DONE: ${totalSent} sent, ${totalEmails} emails =====`);
-    await logToMonitor('Pipeline Complete','Complete',
-      `All ${allPageUrls.length} pages processed â triggering Master Lead Cleaner`,
-      allPageUrls.length, allPageUrls.length, totalEmails);
-
-    console.log('Waiting 15s before Master Lead Cleaner...');
-    await sleep(15000);
-
-    console.log('\nTriggering runMasterLeadCleaner...');
-    try {
-      const mr = await fetch(SHEET_WEBHOOK_URL, {
-        method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ action: 'runMasterLeadCleaner' }), redirect:'follow'
-      });
-      console.log(`  Master Lead Cleaner: HTTP ${mr.status} â ${(await mr.text()).slice(0,80)}`);
-    } catch (me) { console.warn('  Master Lead Cleaner failed:', me.message); }
-
+      if (i < batchUrls.length - 1) {
+        const delay = randomDelay(BETWEEN_PAGE_DELAY_MS);
+        console.log(' Waiting ' + Math.round(delay / 1000) + 's before next page...');
+        await sleep(delay);
+      }
+    }
   } finally {
-    if (browser) await browser.close();
+    await browser.close();
   }
+
+  console.log('\nDone. ' + sent + '/' + batchUrls.length + ' page(s) sent.');
+    const batchNum = Math.floor(startIndex / 10) + 1;
+  await logToMonitor(`FB Batch ${batchNum}`, 'Done',
+    `${batchUrls.length} pages scraped, ${emailsThisBatch} emails found`,
+    startIndex + batchUrls.length, allPageUrls.length, emailsThisBatch
+  );
+    // Auto-trigger next batch if more pages remain
+    if (hasMore) {
+          const ghToken = process.env.GITHUB_TOKEN;
+          const ghRepo  = process.env.GITHUB_REPOSITORY;
+          if (ghToken && ghRepo) {
+                                              // 1. Trigger Apps Script to process + clean the Lead Multiplier sheet
+              console.log('\nTriggering processLatestMultiplierRow in Apps Script...');
+              try {
+                const cleanupRes = await fetch(SHEET_WEBHOOK_URL, {
+                  method:   'POST',
+                  headers:  { 'Content-Type': 'application/json' },
+                  body:     JSON.stringify({ action: 'processLatestMultiplierRow' }),
+                  redirect: 'follow'
+                });
+                const cleanupText = await cleanupRes.text();
+                console.log(`  Cleanup trigger: HTTP ${cleanupRes.status} — ${cleanupText.slice(0, 80)}`);
+              } catch (cleanupErr) {
+                console.warn(`  Cleanup trigger failed: ${cleanupErr.message}`);
+              }
+              // 2. Sleep 90s for Apps Script to finish cleanup before next batch reads the sheet
+              console.log('Sleeping 90s for Apps Script to finish cleanup...');
+              await sleep(90000);
+              // 3. Trigger the next batch run
+              console.log('Triggering next batch...');
+              const res = await fetch(
+                `https://api.github.com/repos/${ghRepo}/actions/workflows/scrape.yml/dispatches`,
+                {
+                  method:  'POST',
+                  headers: { 'Authorization': `Bearer ${ghToken}`, 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json' },
+                  body:    JSON.stringify({ ref: 'main' })
+                }
+              );
+              if (res.ok || res.status === 204) {
+                console.log(`Next batch triggered. Status: ${res.status}`);
+              } else {
+                const body = await res.text();
+                console.warn(`Trigger failed: ${res.status}`);
+              }
+          } else { console.warn('GITHUB_TOKEN or GITHUB_REPOSITORY not set.'); }
+
+        } else {
+      console.log('All pages processed — no more batches.');
+        await logToMonitor('Pipeline Complete', 'Complete',
+    'All pages processed — triggering Master Lead Cleaner',
+    startIndex + batchUrls.length, allPageUrls.length, 0
+  );
+      // Final batch: fire processLatestMultiplierRow then runMasterLeadCleaner
+      console.log('\nTriggering processLatestMultiplierRow in Apps Script...');
+      try {
+        const cleanupRes = await fetch(SHEET_WEBHOOK_URL, {
+          method:   'POST',
+          headers:  { 'Content-Type': 'application/json' },
+          body:     JSON.stringify({ action: 'processLatestMultiplierRow' }),
+          redirect: 'follow'
+        });
+        const cleanupText = await cleanupRes.text();
+        console.log(`  Cleanup trigger: HTTP ${cleanupRes.status} — ${cleanupText.slice(0, 80)}`);
+      } catch (cleanupErr) {
+        console.warn(`  Cleanup trigger failed: ${cleanupErr.message}`);
+      }
+      console.log('Waiting 15s for cleanup to finish...');
+      await sleep(15000);
+      console.log('Triggering runMasterLeadCleaner...');
+      try {
+        const masterRes = await fetch(SHEET_WEBHOOK_URL, {
+          method:   'POST',
+          headers:  { 'Content-Type': 'application/json' },
+          body:     JSON.stringify({ action: 'runMasterLeadCleaner' }),
+          redirect: 'follow'
+        });
+        const masterText = await masterRes.text();
+        console.log(`  Master lead cleaner: HTTP ${masterRes.status} — ${masterText.slice(0, 80)}`);
+      } catch (masterErr) {
+        console.warn(`  Master lead cleaner failed: ${masterErr.message}`);
+      }
+    }
 }
 
-main().catch(e => { console.error('Fatal:', e.message); process.exit(1); });
+main().catch(err => { console.error('Fatal error:', err); process.exit(1); });
