@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       actions: write
-    timeout-minutes: 90
+    timeout-minutes: 60
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
@@ -36,25 +36,17 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      - name: Install Playwright browser (only when FACEBOOK_COOKIES secret is set)
-        env:
-          HAS_COOKIES: ${{ secrets.FACEBOOK_COOKIES }}
-        run: |
-          if [ -n "$HAS_COOKIES" ]; then
-            echo 'FACEBOOK_COOKIES detected — installing Chromium for cookie fallback...'
-            npx playwright install chromium --with-deps
-          else
-            echo 'No FACEBOOK_COOKIES — skipping Playwright install (fetch-only mode)'
-          fi
+      - name: Install Playwright browser
+        run: npx playwright install chromium --with-deps
 
       - name: Run scraper
         env:
-          SHEET_READ_URL:    ${{ secrets.SHEET_READ_URL }}
+          SHEET_READ_URL: ${{ secrets.SHEET_READ_URL }}
           SHEET_WEBHOOK_URL: ${{ secrets.SHEET_WEBHOOK_URL }}
-          SHEET_TAB:         ${{ vars.FB_SHEET_TAB }}
-          FACEBOOK_COOKIES:  ${{ secrets.FACEBOOK_COOKIES }}
-          DEBUG:             ${{ github.event.inputs.debug }}
-          START_INDEX:       ${{ github.event.inputs.start_index || '0' }}
-          GITHUB_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
+          SHEET_TAB: ${{ vars.FB_SHEET_TAB }}
+          FACEBOOK_COOKIES: ${{ secrets.FACEBOOK_COOKIES }}
+          DEBUG: ${{ github.event.inputs.debug }}
+          START_INDEX: ${{ github.event.inputs.start_index || '0' }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: npm run scrape
